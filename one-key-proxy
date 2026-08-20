@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset OKP_TEST_MODE OKP_INTERNAL_TEST_HARNESS
+OKP_PRODUCTION_MODE=true
+export OKP_PRODUCTION_MODE
+
+readonly RUNTIME_DIR=/usr/local/lib/one-key-proxy
+readonly STAGE_DIR=/etc/one-key-proxy/stages
+
+[[ -f ${RUNTIME_DIR}/install.sh && -f ${RUNTIME_DIR}/maintenance.sh ]] || {
+  printf 'ERROR: one-key-proxy 运行文件不完整：%s\n' "$RUNTIME_DIR" >&2
+  exit 1
+}
+
+if [[ -f ${STAGE_DIR}/completed.done ]]; then
+  exec bash "${RUNTIME_DIR}/maintenance.sh" "$@"
+fi
+
+exec bash "${RUNTIME_DIR}/install.sh" --resume "$@"

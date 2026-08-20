@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          mapfile -d '' scripts < <(
+            find . -type f \( -name '*.sh' -o -name 'one-key-proxy' \) \
+              -not -path './.git/*' -print0
+          )
+          if ((${#scripts[@]} == 0)); then
+            echo 'No shell scripts found.' >&2
+            exit 1
+          fi
+          shellcheck "${scripts[@]}"
+
+  tests:
+    name: Syntax, unit, and repository tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run syntax, unit, and repository tests
+        run: bash tests/run.sh

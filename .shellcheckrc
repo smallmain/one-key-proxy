@@ -1,0 +1,4 @@
+shell=bash
+external-sources=true
+source-path=SCRIPTDIR
+disable=SC1003,SC2016,SC2034,SC2119,SC2120,SC2153,SC2329

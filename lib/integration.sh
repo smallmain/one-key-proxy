@@ -2004,7 +2004,7 @@ okp_hook_project_update() {
     fi
     install -d -m 0755 -- "$new_runtime" || status=$?
     if ((status == 0)); then
-        (set -o pipefail; tar -C "$tree" --exclude='.git' -cf - . | \
+        (set -o pipefail; tar -C "$tree" --exclude='.git' --exclude='.env' --exclude='.env.*' --exclude='.deploy-state' -cf - . | \
             tar --no-same-owner --no-same-permissions -C "$new_runtime" -xf -) || status=$?
     fi
     if ((status == 0)); then

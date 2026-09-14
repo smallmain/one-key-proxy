@@ -13,6 +13,25 @@ DEFAULT_REF="main"
 REPOSITORY=${ONE_KEY_PROXY_REPO:-$DEFAULT_REPOSITORY}
 REF=${ONE_KEY_PROXY_REF:-$DEFAULT_REF}
 TEMP_DIR=""
+LOCAL_PROJECT=""
+DEFAULTS_FILE=""
+
+bootstrap_parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --local-project|--defaults-file)
+                [ "$#" -ge 2 ] && [ -n "$2" ] || bootstrap_fail "Missing argument."
+                case $2 in /*) ;; *) bootstrap_fail "Configuration paths must be absolute." ;; esac
+                case $1 in
+                    --local-project) LOCAL_PROJECT=$2 ;;
+                    --defaults-file) DEFAULTS_FILE=$2 ;;
+                esac
+                shift 2
+                ;;
+            *) bootstrap_fail "Unsupported argument: $1" ;;
+        esac
+    done
+}
 
 bootstrap_log() {
     printf '%s\n' "[one-key-proxy] $*" >&2
@@ -326,13 +345,18 @@ bootstrap_run_installer() {
     case $installer_term in
         ''|*[!A-Za-z0-9._+-]*) installer_term=dumb ;;
     esac
+    set --
+    if [ -n "$DEFAULTS_FILE" ]; then
+        set -- --defaults-file "$DEFAULTS_FILE"
+    fi
     env -i PATH="$PATH" HOME=/root USER=root LOGNAME=root TERM="$installer_term" \
         ONE_KEY_PROXY_SOURCE_COMMIT="$RESOLVED_COMMIT" \
         ONE_KEY_PROXY_SOURCE_REPO="$REPOSITORY" \
-        bash "$PROJECT_DIR/install.sh" </dev/tty >/dev/tty 2>&1
+        bash "$PROJECT_DIR/install.sh" "$@" </dev/tty >/dev/tty 2>&1
 }
 
 main() {
+    bootstrap_parse_args "$@"
     bootstrap_validate_source
     bootstrap_require_root
     bootstrap_require_tty
@@ -344,8 +368,16 @@ main() {
     TEMP_DIR=$(mktemp -d /tmp/one-key-proxy.bootstrap.XXXXXX) || \
         bootstrap_fail "Could not create a temporary directory."
     bootstrap_secure_temp_dir
-    bootstrap_resolve_commit
-    bootstrap_download_project
+    if [ -n "$LOCAL_PROJECT" ]; then
+        bootstrap_verify_secure_tree "$LOCAL_PROJECT"
+        PROJECT_DIR=$TEMP_DIR/project
+        cp -R "$LOCAL_PROJECT" "$PROJECT_DIR"
+        RESOLVED_COMMIT=local
+        bootstrap_verify_secure_tree "$TEMP_DIR"
+    else
+        bootstrap_resolve_commit
+        bootstrap_download_project
+    fi
     bootstrap_run_installer
 }
 

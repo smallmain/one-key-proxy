@@ -22,6 +22,7 @@
 - 分阶段执行并支持失败后续跑。
 - 输出 Base64、Xray JSON、Clash/Mihomo 订阅和 VLESS URI；安装终端支持时额外显示二维码。
 - 提供状态、诊断、备份恢复、更新、重配置、凭据轮换和卸载菜单。
+- 支持本机 `.env` 配置、SSH 部署，以及参考已有配置自动添加 SublinkPro 机场和 Surge 本地 Shadowsocks 节点。
 
 ## 支持范围
 
@@ -73,6 +74,129 @@ curl -fL -o bootstrap.sh https://github.com/smallmain/one-key-proxy/releases/dow
 printf '%s  %s\n' '<发布页中的 SHA-256>' bootstrap.sh | sha256sum -c -
 ONE_KEY_PROXY_REF=vX.Y.Z sh bootstrap.sh
 ```
+
+## 从本机管理配置
+
+在自己的电脑运行 `python3 deploy.py`，复用 Git 忽略的 `.env`。需要 Python 3.9+ 和 OpenSSH；SSH 安装要求 VPS 可用 root 登录，且已安装 `sh`、`tar`。自动维护本地 sing-box 当前支持 macOS LaunchAgent。
+
+无参数运行进入中文管理菜单，操作完成后返回菜单：
+
+```text
+1. 安装配置
+2. 添加配置
+3. 删除配置
+4. 查看配置
+5. 检查环境
+0. 退出
+```
+
+“安装配置”通过 SSH 安装 VPS，再添加 SublinkPro 和本地配置；进入这一项后，若有未完成流程，会询问继续上次还是重新开始。“添加配置”可选择 SSH 读取已安装 VPS，或者直接输入订阅地址，无需安装服务器。“查看配置”可进入每条配置的详情，查看资源、端口、状态和中转关系，并修改该配置的中转设置或删除它。
+
+### 本机配置
+
+首次配置（已有 `.env` 时不要覆盖）：
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+| 字段 | 用途 |
+| --- | --- |
+| `SUBLINKPRO_URL` | SublinkPro 的 HTTPS 地址 |
+| `SUBLINKPRO_API_KEY` | SublinkPro API Key，仅在本机使用 |
+| `ENABLE_LOCAL_NODE` | `true` 同时配置 sing-box 和 SublinkPro 本地节点；`false` 只添加机场，默认 `true` |
+| `SUBLINKPRO_GROUP` | 可选机场分组覆盖，内置默认 `SM` |
+| `SINGBOX_CONFIG` | 启用本地节点时必填，本机 sing-box JSON 配置路径 |
+| `SINGBOX_BINARY` | sing-box 可执行文件，默认从 PATH 查找 `sing-box` |
+| `SINGBOX_SERVICE_LABEL` | 启用本地节点时必填，macOS LaunchAgent 标签 |
+| `OKP_ALI_ACCESS_KEY_ID` | 普通 VPS 使用的 AliDNS RAM AccessKey ID |
+| `OKP_ALI_ACCESS_KEY_SECRET` | AliDNS RAM AccessKey Secret |
+| `OKP_ACME_EMAIL` | ACME 邮箱，可留空 |
+
+机场和本地节点模板内置于 `deploy_templates.py`，无需已有机场 ID、节点 ID 或 sing-box 模板 tag。机场默认采用 `SM` 分组、每天更新、`[SM]` 前缀、节点名称预处理及唯一化，并开启流量获取和更新后检测（检测配置 ID 为 `1`）。新本地 SS 节点使用 `aes-128-gcm`、独立随机密码和“稳定”标签，sing-box 与 SublinkPro 使用相同密码；更新已有节点保留其密码、分组和标签。
+
+`.env` 一行一个 `KEY=value`，支持整行注释和整值单/双引号；不会执行 Shell 或展开变量，不支持行尾注释和多行值。未知字段、重复字段、链接或非 `0600` 文件会被拒绝。`.env` 和 `.env.*` 被 Git 忽略，只有无敏感值的 `.env.example` 入库。`0600` 限制访问权限，内容仍是明文。更多安装默认值见示例文件，缺失的必需项仍会交互询问。
+
+### 安装与添加
+
+```bash
+python3 deploy.py check
+python3 deploy.py install root@your-vps --password
+python3 deploy.py install root@your-vps --mode public --domain hk1.example.com \
+  --airport-name "我的香港 VPS" --node-name "香港备用" --local-port 7900
+python3 deploy.py add root@your-vps --password
+python3 deploy.py add --interactive
+python3 deploy.py add 'https://your-vps.example/sub/your-token' --no-local-node
+python3 deploy.py add --subscription-url 'https://your-vps.example/sub/your-token' \
+  --airport-name "我的机场" --node-name "香港备用" --local-port 7900
+```
+
+机场名称与节点名称分别自定义。首次未指定时会询问；SSH 来源默认使用 VPS 节点名称，订阅来源默认使用选中的节点名。无需重复填写已完成的名称与端口。旧命令 `sync` 保留为 `add` 的兼容别名。
+
+订阅地址支持 HTTP/HTTPS；只添加机场时，由 SublinkPro 解析它支持的订阅格式。启用本地节点时，本机支持明文 URI 列表或 Base64 订阅中的 **VLESS TCP + REALITY + Vision**。多个可用节点时交互选择一条生成本地出站，非交互可用 `--subscription-node 1` 指定序号；恢复时使用连接指纹识别，避免订阅顺序变化选错节点。机场仍保留整个订阅。自签名证书可在向导中选择，或传入 `--insecure-subscription`；重定向地址需填写最终 URL。交互输入地址可避免将订阅令牌写进 Shell 命令历史。
+
+`ENABLE_LOCAL_NODE` 统一控制 sing-box 和 SublinkPro 本地节点。命令行 `--local-node` / `--no-local-node` 优先于菜单和 `.env`；`--local-port` 隐含启用本地节点，与 `--no-local-node` 互斥。启用但缺少 sing-box 配置会停止。关闭时保留已有本地资源，删除请使用“删除配置”。`install --no-sync` 只安装 VPS。
+
+本地节点名为 `[SM]{节点名称} - 本地`，连接 `127.0.0.1:本地端口`。端口首次必须填写，范围为 `1–65535`；后续可复用或修改。这里是 **Surge 所在设备的本地 Shadowsocks 端口**，不在 VPS 上新增监听。sing-box 创建 `ss-{节点名称}-in`、`vless-{节点名称}-out` 和对应路由；已接管的 SOCKS 出站使用 `socks-{节点名称}-out`。tag 创建后保持稳定，名称改变不破坏中转引用。
+
+安装/SSH 添加向导支持主机密码（默认）、私钥、SSH 配置/agent。SSH 端口留空沿用配置；`--port 2222` 可覆盖。主机别名也受支持。**`--password` 后面不填写密码**，OpenSSH 在终端中确认主机指纹并无回显输入密码，然后复用共享连接上传和读取状态。密码不进入 Python、进程参数、环境变量或临时文件。私钥可用 `--identity ~/.ssh/my_key`，与密码开关互斥。不指定认证参数的直接子命令沿用 SSH 配置/agent。
+
+安装上传当前本机源码（含未提交修改），不要求先 push GitHub。白名单阻止上传 `.env`、Git 历史和 SublinkPro 凭据。AliDNS 等安装默认值经 SSH 输入流送入 root-only 临时文件；VPS 安装器仍保留最终确认页。AliDNS 凭据保存在 VPS 的受保护配置中供续期使用。完成或中断时清理临时文件；断网时可能需要按提示手动清理。
+
+### 更新与未完成流程
+
+SSH 来源按 VPS 安装标识定位；直接订阅来源按 SublinkPro 实例和完整 URL 生成稳定管理 ID。重复添加同一来源会更新同一机场，修改名称不会产生新机场。直接订阅地址变化会视为新来源，可删除旧配置后重新添加。机场备注中的独立行 `[okp:管理ID]`、本地分享链接片段 `okp-local:管理ID` 用于验证所有权，显示名称不附带管理 ID。已有配置保留机场设置、名称、本地凭据和标签，仅应用来源变化或显式覆盖。没有管理标识的手工资源不会自动接管。
+
+每个输入完成后立即写入 `.deploy-state/pending.json`。中断、登录失败或任一添加步骤失败都会保留；进入安装/添加后可继续或重新开始，也可运行：
+
+```bash
+python3 deploy.py --resume
+python3 deploy.py --resume --local-port 7901
+python3 deploy.py install root@another-vps --fresh
+```
+
+同一来源与配置文件的命令重试自动复用记录，显式参数优先。主机密码、私钥内容、API Key 和原始 VLESS URI 不写入恢复记录；**直接输入的订阅 URL 可能含令牌，会保存在此私有恢复文件中**。目录权限 `0700`、文件 `0600`，原子写入并加进程锁；整个目录被 Git 忽略且不会上传到 VPS。每个项目保留一个未完成流程，只有本次启用的步骤全部成功才删除记录，检查和退出不清除。
+
+已确认 VPS 安装完成后，恢复只回读 VPS 并重试添加，不重复安装；安装 ID 改变会停止。集成失败不会回滚 VPS。SublinkPro 机场和本地节点经 API 回读验证，订阅拉取/检测仍为后台异步任务，命令成功不表示这些后台任务已完成。新增资源不会改变已有订阅的固定节点选择。
+
+### 本地配置与中转
+
+候选 sing-box 配置必须通过实际 `sing-box check`，然后保存 `0600` 备份、原子替换并重启 LaunchAgent。重启会短暂中断本地代理连接，失败尝试回滚；外部修改、端口冲突或共享引用会阻止不安全的覆盖/删除。备份位于配置目录的 `.one-key-proxy-backup-*.json`，包含敏感配置。`check` 验证 `.env`、OpenSSH、SublinkPro API 认证及已启用的 sing-box 配置，不更改业务配置或重启服务。
+
+**查看配置 → 选择配置 → 中转设置** 可修改该配置是否需要中转以及使用哪个节点，详情显示当前关系。安装和添加向导也支持选择。命令行快捷方式：
+
+```bash
+python3 deploy.py relay 美国-家宽 --via 美国
+python3 deploy.py relay 某节点 --direct
+python3 deploy.py add root@your-vps --via 美国
+```
+
+设置同时更新 sing-box 出站的 `detour` 与 SublinkPro 远端节点的 `DialerProxyName`，保留原协议、服务器、端口和密码。支持链式中转，拒绝自引用和循环；仍被依赖的中转节点不能删除。本地 SS 继续连接 loopback。机场订阅下载代理与数据通道中转独立。失败保留 `relaying` 状态，可再次进入同一配置的中转设置继续。
+
+### 删除配置
+
+`.deploy-state/managed.json` 持久保存受管资源，不随成功后的恢复记录一起删除。它包含管理 ID、资源 ID、tag、指纹、路径和状态，不包含代理密码、VLESS URI、订阅令牌或 API Key。原有已接管配置仍使用这一清单。
+
+```bash
+python3 deploy.py list
+python3 deploy.py list --interactive
+python3 deploy.py remove <管理ID或配置名称>
+```
+
+“删除配置”或配置详情中的删除操作会预览资源并要求确认，清理 sing-box 入站/出站/路由、SublinkPro 机场及导入节点、配套本地 SS 节点，以及已接管的手工远端节点。**不需要连接过期 VPS**，不会卸载服务器。外部引用会阻止删除；中断保留 `deleting` 状态，再次删除同一配置继续清理，全部成功后才移除记录。
+
+### 明确接管现有配置
+
+`adopt` 接受当前用户拥有的 `0600` JSON 清单，可明确关联现有 sing-box 入站/出站、SublinkPro 机场或手工远端节点、本地节点及中转关系，并批量重命名引用。清单包含 `groups` 数组（每项含 `name`、`inbound`、`outbound`、`airport_id`、`remote_node_id`、`local_node_id`、`relay`），以及明确允许移除的 `remove_inbounds`、`remove_outbounds` 和 `default_outbound`。`relay` 使用同一清单中的分组名称；手工远端节点的 `airport_id` 为 `null`。
+
+```bash
+python3 deploy.py adopt .deploy-state/adopt-existing.json
+```
+
+接管会先核验本地 SS 凭据、远端配置和现有中转关系，再保存备份，给 SublinkPro 资源添加管理标识，最后一次性重写 sing-box 并重载。现有 SublinkPro 显示名与连接参数保留。接管记录标记为 `adopted`，管理 ID 在本机生成，并非声称这些 VPS 由安装器创建；此类资源可直接使用 `relay` 和 `remove` 管理，无需 SSH。
+
+中断后重复同一份清单会核对并继续；外部修改会使接管停止。`.deploy-state/adoption-*.json` 是 `0600` 的敏感接管备份，包含原始代理配置，已被 Git 忽略。成功后保留用于审计/恢复。删除手工接管的部署会同时清理其手工远端节点；内置模板不受资源删除影响。
 
 ## 安装前准备
 
@@ -145,7 +269,7 @@ ONE_KEY_PROXY_REF=vX.Y.Z sh bootstrap.sh
 
 引导层是例外：缺少下载工具时，它会在进入确认页前通过系统包管理器安装最低依赖；Arch Linux 会因此执行 `pacman -Syu`。最终确认后，RHEL 系安装 Fail2ban 时还可能以尽力而为方式安装 `epel-release`；失败只会记录为降级告警。
 
-面板用户名和密码默认随机生成，也可以在最终确认页修改。标准 `bootstrap.sh` 会以干净环境启动主安装器，不透传任意 `OKP_*` 配置变量；部署参数必须通过交互流程采集和确认，项目不提供静默 `--yes` 安装。
+面板用户名和密码默认随机生成，也可以在最终确认页修改。标准 `bootstrap.sh` 会以干净环境启动主安装器，不透传任意 `OKP_*` 配置变量；本机 SSH 入口通过显式的 `--defaults-file` 提供白名单默认值。所有参数都必须经过交互确认，项目不提供静默 `--yes` 安装。
 
 如果系统上已有非本项目管理的 3x-ui，安装器会停止且不会接管。中途失败时，重新运行同一入口会严格校验阶段名称、完成时间和适用的真实后置条件，再从失败处继续。首次调用官方安装器前会写入恢复事务；若中断时只落下二进制，或结果文件已经写入但服务尚未完成，续跑会核对已确认身份、停止并禁用残留服务，再以同一版本和配置重放。只有尚无阶段标记、证书或 3x-ui 资源的初始化中断状态才会被保守清理；无法证明安全时会停止并要求诊断。
 
@@ -222,7 +346,7 @@ uninstall             逐项卸载
 
 ## 开发
 
-依赖 Bash、ShellCheck，以及测试所需的常见 Unix 工具。
+依赖 Bash、Python 3.9+、ShellCheck，以及测试所需的常见 Unix 工具。
 
 ```bash
 git clone https://github.com/smallmain/one-key-proxy.git

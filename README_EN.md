@@ -22,6 +22,7 @@ Both NAT VPS instances and regular VPS instances with a dedicated public address
 - Uses resumable, verified installation stages.
 - Outputs raw Base64, Xray JSON, Clash/Mihomo subscriptions, and a VLESS URI; displays a QR code in a capable installation terminal.
 - Provides status, diagnostics, backup/restore, updates, reconfiguration, credential rotation, and removal.
+- Supports local `.env` configuration, SSH deployment, and SublinkPro airports plus Surge local Shadowsocks nodes based on existing references.
 
 ## Supported platforms
 
@@ -73,6 +74,122 @@ curl -fL -o bootstrap.sh https://github.com/smallmain/one-key-proxy/releases/dow
 printf '%s  %s\n' '<SHA-256 from the release page>' bootstrap.sh | sha256sum -c -
 ONE_KEY_PROXY_REF=vX.Y.Z sh bootstrap.sh
 ```
+
+## Manage configurations from your computer
+
+Run `python3 deploy.py` on your computer to reuse a Git-ignored `.env`. Requires Python 3.9+ and OpenSSH; SSH installation needs root access, `sh`, and `tar` on the VPS. Automatic local sing-box integration currently supports macOS LaunchAgents.
+
+The Chinese management menu returns after each operation:
+
+```text
+1. 安装配置 (Install)
+2. 添加配置 (Add)
+3. 删除配置 (Delete)
+4. 查看配置 (View)
+5. 检查环境 (Check environment)
+0. 退出 (Exit)
+```
+
+Install sets up a VPS over SSH and adds its resources. An unfinished workflow is offered for resume or restart after entering Install/Add. Add supports either reading an installed VPS over SSH or entering a subscription URL directly. View opens each configuration's details, including local ports, resources, status, and its relay setting; relay editing belongs to that configuration.
+
+### Local configuration
+
+Create the private file once, without overwriting an existing one:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+| Key | Purpose |
+| --- | --- |
+| `SUBLINKPRO_URL` | SublinkPro HTTPS address |
+| `SUBLINKPRO_API_KEY` | API key, used only on this computer |
+| `ENABLE_LOCAL_NODE` | Default `true`: configure both sing-box and SublinkPro local nodes; `false`: airport only |
+| `SUBLINKPRO_GROUP` | Optional airport group override; built-in default is `SM` |
+| `SINGBOX_CONFIG` | Required with local nodes: user-owned `0600` sing-box JSON file |
+| `SINGBOX_BINARY` | Executable path; default `sing-box` on PATH |
+| `SINGBOX_SERVICE_LABEL` | Required with local nodes: macOS LaunchAgent label |
+| `OKP_ALI_ACCESS_KEY_ID` | AliDNS RAM access key ID for public VPS installations |
+| `OKP_ALI_ACCESS_KEY_SECRET` | AliDNS access key secret |
+| `OKP_ACME_EMAIL` | Optional ACME email |
+
+Templates live in `deploy_templates.py`; no existing airport IDs, local-node IDs, or sing-box template tags are required. Airport defaults include group `SM`, daily updates, prefix `[SM]`, custom node renaming, uniqueness, usage collection and post-update detection (profile ID `1`). New local nodes use `aes-128-gcm`, an independent random password and the “稳定” tag. sing-box and SublinkPro receive identical local credentials; updates retain existing credentials, groups and tags.
+
+The literal dotenv reader accepts whole-line comments and matching quotes, without shell evaluation or expansion. Unknown/duplicate keys, links, control characters, and files not owned by you with mode `0600` are rejected. `.env` and `.env.*` are ignored; only the empty example is tracked. Permissions restrict access but do not encrypt the file.
+
+### Install and add
+
+```bash
+python3 deploy.py check
+python3 deploy.py install root@your-vps --password
+python3 deploy.py add root@your-vps --password
+python3 deploy.py add --interactive
+python3 deploy.py add 'https://your-vps.example/sub/your-token' --no-local-node
+python3 deploy.py add --subscription-url 'https://your-vps.example/sub/your-token' --airport-name "My airport" --node-name "Hong Kong" --local-port 7900
+```
+
+Airport and node names are independently configurable. First import prompts for missing values, defaulting to the VPS or selected subscription node name. Noninteractive runs use defaults. `--name` aliases `--node-name`; the old `sync` command remains an alias for `add`.
+
+HTTP/HTTPS subscription URLs are supported. For airport-only imports, SublinkPro handles its supported formats. Creating a local outbound requires a plain URI list or Base64 subscription containing **VLESS TCP + REALITY + Vision**. Choose one compatible node interactively when there are several, or pass `--subscription-node 1`. Resume stores its connection fingerprint so reordering cannot select another node. The airport retains the whole subscription. Self-signed certificates require the wizard option or `--insecure-subscription`; redirects require entering the final URL. Interactive URL input avoids putting access tokens in shell history.
+
+`--local-node` and `--no-local-node` override the wizard and `.env`. `--local-port` implies local nodes and conflicts with `--no-local-node`. Local nodes require sing-box configuration and always configure both systems. Disabling local nodes leaves existing local resources intact; use Delete to remove them. `install --no-sync` installs only the VPS.
+
+Companion nodes are named `[SM]{node name} - 本地` and connect to `127.0.0.1:local-port`. The first import requires a port from `1–65535`; updates reuse it unless overridden. This port belongs to the Surge device, not the VPS. sing-box tags use `ss-{name}-in` and `vless-{name}-out`; adopted SOCKS exits use `socks-{name}-out`. Tags stay stable after creation to preserve relay references.
+
+The SSH wizard supports host password (default), private key, or SSH configuration/agent. A blank port retains SSH defaults; override with `--port 2222`. Host aliases are supported. **Do not put a password after `--password`**: OpenSSH performs host verification and hidden terminal authentication, then reuses a shared connection. Passwords never enter Python, process arguments, environment variables, or temporary files. `--identity ~/.ssh/my_key` selects a private key and conflicts with password mode. Direct commands without authentication flags retain SSH configuration/agent behavior.
+
+Install uploads local runtime sources, including uncommitted edits, without requiring a GitHub push. An allowlist excludes `.env`, Git history and SublinkPro credentials. AliDNS and installation defaults cross SSH stdin into a root-only temporary file; the VPS installer retains its confirmation page. AliDNS credentials remain in protected VPS configuration for renewal. Temporary files are cleaned up on completion/interruption, with manual cleanup potentially needed after a disconnect.
+
+### Updates and recovery
+
+SSH imports use the VPS installation ID; URL imports derive a stable management ID from the SublinkPro instance and full URL. Repeating the same source updates the same airport independently of display names. A changed direct subscription URL is a new source; remove the old configuration and add the new one. Ownership uses a standalone `[okp:management-id]` airport remark and `okp-local:management-id` local link fragment, separate from display names. Existing settings are preserved unless explicitly overridden. Unmarked manual resources are not automatically adopted.
+
+Each completed input is immediately checkpointed in `.deploy-state/pending.json`. Failure or interruption retains it; enter Install/Add to continue or restart, or use:
+
+```bash
+python3 deploy.py --resume
+python3 deploy.py --resume --local-port 7901
+python3 deploy.py install root@another-vps --fresh
+```
+
+Matching retries reuse saved input, with explicit flags taking precedence. Host passwords, private-key contents, API keys and raw VLESS URIs are not cached. **A directly supplied subscription URL, including its possible access token, is stored in the private recovery file.** The directory is `0700`, files are `0600`, writes are atomic and locked, and the whole directory is Git-ignored and excluded from VPS uploads. One unfinished workflow is retained per project; only success of all enabled steps clears it. Check and Exit leave it intact.
+
+Once VPS installation has been verified, resume reads the VPS and retries adding resources without rerunning the installer; a changed installation ID stops recovery. Integration failure does not roll back the VPS. Airport and local-node settings are verified by API readback, while subscription fetching and detection remain asynchronous. New resources do not alter existing subscriptions' fixed selections.
+
+### Local configuration and relays
+
+Candidate configurations must pass the actual `sing-box check` before a `0600` backup, atomic replacement and LaunchAgent restart. Restart briefly interrupts connections; failure attempts rollback. External edits, port conflicts and shared references guard against accidental overwrite/deletion. Sensitive backups live beside the configuration as `.one-key-proxy-backup-*.json`. Check validates dotenv, OpenSSH, API authentication and enabled sing-box configuration without altering resources or restarting services.
+
+Use **View → select configuration → Relay settings** to choose whether that node needs a relay and which managed node to use. Install/Add also offers relay selection. CLI shortcuts remain available:
+
+```bash
+python3 deploy.py relay Residential --via US
+python3 deploy.py relay SomeNode --direct
+python3 deploy.py add root@your-vps --via US
+```
+
+Relay changes update sing-box `detour` and the SublinkPro remote node's `DialerProxyName`, preserving protocol, host, port and credentials. Chains are supported, cycles and self-reference are rejected, and referenced relays cannot be deleted. Local SS continues to use loopback. Subscription downloading is independent of the data relay. Failed relay changes retain `relaying` status; reopen that configuration's relay settings to continue.
+
+### Delete configurations
+
+`.deploy-state/managed.json` persists independently of the cleared recovery file. It records management/resource IDs, tags, fingerprints, paths and states, without proxy passwords, raw VLESS URIs, subscription tokens or API keys. Existing adopted configurations retain their records.
+
+```bash
+python3 deploy.py list
+python3 deploy.py list --interactive
+python3 deploy.py remove <management-id-or-name>
+```
+
+Delete previews and confirms removal of owned sing-box listeners/outbounds/routes, SublinkPro airports and imported nodes, companion local SS nodes, and adopted manual remote nodes. **No connection to the expired VPS is required** and the server is not uninstalled. External references block deletion. Interrupted deletion retains a `deleting` record; repeat to reconcile remaining resources, clearing the record only after completion.
+
+### Explicit adoption
+
+`python3 deploy.py adopt manifest.json` accepts a user-owned `0600` manifest. It contains `groups` (each with `name`, `inbound`, `outbound`, `airport_id`, `remote_node_id`, `local_node_id`, and `relay`), explicit `remove_inbounds` / `remove_outbounds` lists, and `default_outbound`. `relay` names another group in the same manifest; manually managed remote nodes use a null `airport_id`.
+
+Adoption verifies local SS credentials, remote settings and existing relay relationships before journaling the change, marking SublinkPro ownership, and rewriting all named sing-box references in one reload. SublinkPro display names and connection parameters remain intact. Adopted IDs are assigned locally and do not claim installer ownership of the VPS. Their resources can be managed through `relay` and `remove` without SSH, including removal of manually managed remote nodes.
+
+Repeat the same manifest after interruption; unexpected external changes stop recovery. Sensitive `0600` backups under `.deploy-state/adoption-*.json` contain original proxy configuration and remain Git-ignored. Resource deletion does not affect the built-in templates.
 
 ## Before installation
 
@@ -138,7 +255,7 @@ The installer asks you to choose NAT or regular VPS mode, collects only mode-spe
 
 The bootstrap is the exception: if download tools are missing, it installs minimum prerequisites through the system package manager before the review; on Arch Linux this invokes `pacman -Syu`. After final confirmation, RHEL-family Fail2ban setup may also try to install `epel-release` on a best-effort basis. Failure is reported as a degraded protection warning rather than a core deployment failure.
 
-The standard `bootstrap.sh` intentionally starts the main installer with a clean environment and does not forward arbitrary `OKP_*` configuration variables. Deployment values must be collected and confirmed through the interactive flow; there is no unattended `--yes` mode.
+The standard `bootstrap.sh` intentionally starts the main installer with a clean environment and does not forward arbitrary `OKP_*` configuration variables. The local SSH launcher provides allowlisted defaults through an explicit `--defaults-file`. All deployment values still require interactive confirmation; there is no unattended `--yes` mode.
 
 If an unmanaged 3x-ui installation already exists, the tool stops without taking ownership. Re-running the same bootstrap after an interrupted project-owned installation strictly validates the stage name, completion timestamp, and applicable live postconditions before resuming. A recovery transaction is written before the first official-installer invocation; binary-only and result-written-before-service interruptions are replayed with the same version and configuration only after the confirmed identity is checked and residual service activity is stopped and disabled. An abandoned initialization state is removed only when no stage marker, certificate, or 3x-ui resource exists; ambiguous cases stop for diagnosis.
 
@@ -201,6 +318,8 @@ Domain, NAT public-IP, and certificate identity changes use a recoverable two-ph
 See [DESIGN.md](DESIGN.md) for the complete state machine, ownership rules, and security model.
 
 ## Development
+
+Requires Bash, Python 3.9+, ShellCheck, and common Unix test utilities.
 
 ```bash
 git clone https://github.com/smallmain/one-key-proxy.git

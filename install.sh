@@ -323,7 +323,7 @@ acquire_operation_lock() {
 
 usage() {
   cat <<'EOF'
-用法: install.sh [--resume]
+用法: install.sh [--resume | --defaults-file FILE]
 
 请优先使用仓库 README 中的 bootstrap.sh 一键命令。
 EOF
@@ -421,7 +421,8 @@ install_runtime_files() {
     return 1
   }
   if ! tar -C "$SCRIPT_DIR" \
-    --exclude='.git' --exclude='work' --exclude='*.tmp' \
+    --exclude='.git' --exclude='.env' --exclude='.env.*' --exclude='.deploy-state' \
+    --exclude='__pycache__' --exclude='work' --exclude='*.tmp' \
     -cf - . | tar -C "$temporary" --no-same-owner -xf -; then
     rm -rf -- "$temporary"
     return 1
@@ -1749,6 +1750,11 @@ main() {
   local status
   case $INSTALL_ACTION in
     ''|--resume) ;;
+    --defaults-file)
+      [[ $# == 2 ]] || { usage >&2; return 2; }
+      platform_require_root || return 1
+      config_load_defaults_file "$2" || return 1
+      ;;
     -h|--help) usage; return 0 ;;
     *) usage >&2; return 2 ;;
   esac
@@ -1762,6 +1768,7 @@ main() {
 
   if state_is_managed; then
     if stage_is_done completed; then
+      [[ $INSTALL_ACTION != --defaults-file ]] || return 0
       exec bash "${RUNTIME_DIR}/maintenance.sh" "${@:2}"
     fi
     prepare_resume

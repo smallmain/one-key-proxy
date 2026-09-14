@@ -38,6 +38,7 @@ test_scripts=(
   test_install_dns.sh
   test_xui_supply.sh
   test_bootstrap.sh
+  test_deploy.sh
   test_maintenance_security.sh
   test_repo.sh
 )
@@ -52,6 +53,12 @@ for test_script in "${test_scripts[@]}"; do
     failures=$((failures + 1))
   fi
 done
+
+executed=$((executed + 1))
+printf '\nLocal deployment and SublinkPro tests\n'
+if ! python3 -m unittest discover -s "$TEST_DIR" -p 'test_deploy*.py'; then
+  failures=$((failures + 1))
+fi
 
 printf '\nExecuted %d syntax/test groups; failures: %d\n' "$executed" "$failures"
 ((failures == 0))

@@ -10,6 +10,39 @@ else
   : "${DEFAULT_REALITY_TARGET:=www.cloudflare.com:443}"
 fi
 
+# The local SSH launcher sends only this allowlist, using the state file codec.
+# Never source the file or accept controls such as PATH/OKP_TEST_MODE from it.
+config_load_defaults_file() {
+  local file=$1 mode line key encoded value
+  local -A defaults=()
+  _state_secure_regular_file "$file" || { die '安装默认配置不是安全的普通文件。'; return 1; }
+  mode=$(_state_file_attribute "$file" '%a' '%Lp') || return 1
+  [[ $mode == 600 ]] || { die '安装默认配置权限必须为 0600。'; return 1; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *=* ]] || { die '安装默认配置格式无效。'; return 1; }
+    key=${line%%=*}
+    encoded=${line#*=}
+    case $key in
+      OKP_MODE|OKP_PUBLIC_IPV4|OKP_PUBLIC_IPV6|OKP_ENABLE_IPV6|\
+      OKP_PANEL_USERNAME|OKP_PANEL_PASSWORD|OKP_NODE_NAME|OKP_REALITY_TARGET|\
+      OKP_FQDN|OKP_ALI_ACCESS_KEY_ID|OKP_ALI_ACCESS_KEY_SECRET|OKP_ACME_EMAIL|\
+      OKP_PANEL_PORT|OKP_NODE_PORT|OKP_SUB_PORT|OKP_PANEL_MAP|OKP_NODE_MAP|OKP_SUB_MAP) ;;
+      *) die '安装默认配置包含不支持的字段。'; return 1 ;;
+    esac
+    [[ -z ${defaults[$key]+present} ]] || { die '安装默认配置包含重复字段。'; return 1; }
+    value=$(_state_decode "$encoded") || { die '安装默认配置编码无效。'; return 1; }
+    ! has_control_chars "$value" || { die '安装默认配置不能包含控制字符。'; return 1; }
+    [[ $(_state_encode "$value") == "$encoded" ]] || { die '安装默认配置编码无效。'; return 1; }
+    defaults[$key]=$value
+  done <"$file"
+  for key in "${!defaults[@]}"; do
+    printf -v "$key" '%s' "${defaults[$key]}"
+    case $key in
+      *PASSWORD|*ACCESS_KEY*) secret_register "${defaults[$key]}" ;;
+    esac
+  done
+}
+
 detect_public_ipv4() {
   local endpoint candidate
   for endpoint in \

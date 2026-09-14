@@ -166,8 +166,39 @@ test_bootstrap_entrypoint_contract_is_present() {
   assert_contains "$script" 'bootstrap_require_root'
   assert_contains "$script" 'bootstrap_require_tty'
   assert_contains "$script" 'bootstrap_require_service_manager'
-  assert_contains "$script" 'bash "$PROJECT_DIR/install.sh" </dev/tty >/dev/tty 2>&1'
+  assert_contains "$script" 'bash "$PROJECT_DIR/install.sh" "$@" </dev/tty >/dev/tty 2>&1'
   assert_contains "$script" 'main "$@"'
+}
+
+test_local_project_bootstrap_uses_uploaded_sources() {
+  local project=$TEST_SANDBOX/uploaded-project defaults=$TEST_SANDBOX/defaults.env
+  mkdir -p "$project"
+  printf 'uploaded-source\n' >"$project/install.sh"
+  : >"$defaults"
+  bootstrap_require_root() { :; }
+  bootstrap_require_tty() { :; }
+  bootstrap_require_linux_arch() { :; }
+  bootstrap_detect_family() { :; }
+  bootstrap_require_service_manager() { :; }
+  bootstrap_install_prerequisites() { :; }
+  bootstrap_secure_temp_dir() { :; }
+  bootstrap_verify_secure_tree() { [[ -d $1 ]]; }
+  bootstrap_resolve_commit() { fail 'local deployment must not resolve a remote commit'; }
+  bootstrap_download_project() { fail 'local deployment must not download project code'; }
+  bootstrap_run_installer() {
+    assert_eq uploaded-source "$(<"$PROJECT_DIR/install.sh")"
+    assert_eq local "$RESOLVED_COMMIT"
+    assert_eq "$defaults" "$DEFAULTS_FILE"
+    [[ $PROJECT_DIR == "$TEMP_DIR"/* && $PROJECT_DIR != "$project" ]]
+  }
+  main --local-project "$project" --defaults-file "$defaults"
+  bootstrap_cleanup
+}
+
+test_bootstrap_rejects_malformed_local_arguments() {
+  assert_failure bash -c 'source "$1"; bootstrap_parse_args --defaults-file relative' _ "$BOOTSTRAP_LIBRARY"
+  assert_failure bash -c 'source "$1"; bootstrap_parse_args --local-project' _ "$BOOTSTRAP_LIBRARY"
+  assert_failure bash -c 'source "$1"; bootstrap_parse_args --unknown' _ "$BOOTSTRAP_LIBRARY"
 }
 
 run_test 'bootstrap repository and ref inputs reject injection' test_source_coordinates_are_strict
@@ -176,5 +207,7 @@ run_test 'bootstrap resolves and pins a full Git commit SHA' test_commit_resolut
 run_test 'bootstrap secures archive extraction before verification' test_archive_extraction_is_secured_before_use
 run_test 'bootstrap guards the extraction parent and execution tree' test_security_guards_cover_parent_and_execution
 run_test 'bootstrap retains root, TTY, init, and direct-run guards' test_bootstrap_entrypoint_contract_is_present
+run_test 'local bootstrap uses uploaded sources and explicit defaults' test_local_project_bootstrap_uses_uploaded_sources
+run_test 'bootstrap rejects malformed local source arguments' test_bootstrap_rejects_malformed_local_arguments
 
 finish_tests

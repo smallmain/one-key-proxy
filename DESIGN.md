@@ -119,8 +119,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/smallmain/one-key-proxy/main/
 4. 密码、AccessKey Secret 等使用无回显输入；确认页对 AccessKey Secret 只显示掩码和末四位。
 5. 所有默认值都在最终确认页列出，并提供“按编号修改”循环。
 6. 用户选择“确认执行”前，不安装 3x-ui、不修改 DNS、不写防火墙、不创建证书；`bootstrap.sh` 为保证自身运行而安装最低下载依赖是例外。
-7. 标准 `bootstrap.sh` 以干净环境启动主安装器，不透传任意 `OKP_*` 配置变量；部署参数全部通过 TTY 采集并在确认页复核，第一版不提供完全无人值守的 `--yes`。
-8. `Ctrl-C` 或拒绝确认时，清理临时秘密文件且不创建业务资源；引导层此前安装的最低依赖不会回滚。
+7. 标准 `bootstrap.sh` 以干净环境启动安装器。本机 `deploy.py` 从 Git 忽略的 `0600` `.env` 读取字面值，通过 SSH 输入流传递白名单默认配置和本机源码，禁止 source。VPS 安装器仍保留最终确认页，SublinkPro 凭据只在本机使用。安装完成或手动 `add` 时，机场与本地 SS 默认配置取自 `deploy_templates.py`，无需外部模板资源；机场与节点分别命名。新 SS 使用独立随机密码，与 sing-box 入站一致，名称为 `[SM]{节点名称} - 本地`。重复添加按独立所有权标识更新，保留既有设置；原始代理凭据不进入清单。NAT 自动跳过订阅 TLS 校验，普通 VPS 保持校验。SublinkPro 回读验证后异步拉取订阅与检测。
+8. 本机主菜单固定为安装配置、添加配置、删除配置、查看配置、检查环境、退出，操作完成后返回菜单。进入安装/添加后才提供继续上次或重新开始。添加支持 SSH 或直接订阅 URL；SSH 登录支持原生无回显密码、私钥及 SSH 配置/agent。`ENABLE_LOCAL_NODE` 默认 `true`，统一启用 sing-box 与 SublinkPro 本地节点；`--local-node` / `--no-local-node` 优先于向导与 `.env`，`--local-port` 隐含启用且与关闭互斥。启用时 sing-box 配置必需；关闭保留已有资源。检查只读验证启用的组件，退出不读凭据或访问网络。
+9. `Ctrl-C` 或拒绝确认时，清理临时秘密文件且不创建业务资源；引导层此前安装的最低依赖不会回滚。
+10. 每项输入立即原子写入 Git 忽略的 `.deploy-state/pending.json`，目录 `0700`、文件 `0600`，进程锁防并发覆盖。记录包含允许的选项、阶段、安装 ID，以及直接输入的订阅 URL（可能含令牌）；不含主机密码、API Key、私钥内容或原始 VLESS URI。菜单与 `--resume` 恢复未完成流程，匹配来源自动复用，显式参数优先，`--fresh` 替换旧记录。VPS 已安装时只回读并重试添加；来源身份变化停止。全部启用步骤成功才清除记录，检查和退出不清除。
+11. 启用本地节点时，生成受管 SS 入站、VLESS 出站和路由，同时添加 SublinkPro 本地 SS。连接参数来自 SSH 或 HTTP/HTTPS 订阅；本地解析支持 URI 列表/Base64 中的 VLESS TCP REALITY Vision，多节点需选择并保存连接指纹。直接订阅由实例 URL 和订阅 URL 派生稳定 ID，清单只存来源摘要。候选配置经过实际 sing-box 检查、私有备份、原子替换和 launchd 重载，失败尝试回滚。`.deploy-state/managed.json` 持久保存资源 ID、tag、指纹、路径和状态。删除核验所有权后清理两侧资源，无需 VPS 在线，失败保留 `deleting` 以供重试。
+12. 显式 `adopt` 按清单接管机场或手工节点并备份、重命名 sing-box 引用，保留真实协议与参数。管理 ID 在本机生成，`adopted` 不代表安装器管理 VPS。新 tag 使用 `ss-{名称}-in` 与 `{协议}-{名称}-out`，创建后稳定。每条配置详情内设置是否需要中转和中转节点；CLI `relay` / `--via` 保留快捷入口，同时配置 sing-box `detour` 与 SublinkPro 远端前置代理，拒绝循环，失败保存 `relaying`，被依赖的上游禁止删除。订阅下载代理独立；原始接管快照仅存入 Git 忽略的 `0600` 备份。
 
 ### 5.2 共用参数
 

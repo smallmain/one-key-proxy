@@ -9,6 +9,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Local Python/OpenSSH deployment with a Git-ignored `.env`, allowlisted installation defaults, built-in SublinkPro airport defaults and independent airport/node names.
+- Companion Surge local Shadowsocks nodes with independent random passwords, matching sing-box listeners, user-supplied ports and repeatable updates that retain credentials and tags.
+- Configuration management menu for install, add via SSH or subscription URL, delete, view and environment checks; relay settings live inside each configuration's details.
+- Unified `ENABLE_LOCAL_NODE` control for sing-box and SublinkPro local nodes, without external template IDs or tags; `add` replaces the former `sync` command with a compatibility alias.
+- Explicit SSH password login through the wizard or `--password`, with native hidden terminal input and authentication before upload over a shared connection.
+- Immediate checkpoints for unfinished local workflows, menu/CLI resume, retained names and ports across failed syncs, and automatic record removal after success; passwords and API credentials are excluded.
+- Built-in sing-box templates with validated atomic updates, protected backups and launchd reload/rollback, plus persistent ownership inventory and offline-VPS cleanup guarded against shared references.
+- Explicit adoption and readable sing-box tags for existing proxies, synchronized relay selection for sing-box/SublinkPro, cycle prevention, and managed cleanup of manual remote nodes.
 - Trusted-TLS reachability preflight for the selected REALITY target.
 - Recoverable two-phase TLS identity transitions for maintenance reconfiguration and renewal.
 

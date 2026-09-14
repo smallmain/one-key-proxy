@@ -203,6 +203,8 @@ Create these three **TCP** mappings in the provider portal before running the in
 | VLESS inbound | `56665:443` | External `56665` to VPS `443` |
 | Subscription HTTPS | `56666:2096` | External `56666` to VPS `2096` |
 
+Prompts show default internal ports: panel `2053`, VLESS `443`, subscription `2096`. Enter only the external port (panel `56664` means `56664:2053`), or provide the full mapping to override the internal port. The first setup requires the provider-assigned external port. When editing, Enter retains the current mapping and an external-only value retains the current internal port. The `.env` keys `OKP_PANEL_MAP`, `OKP_NODE_MAP`, and `OKP_SUB_MAP` support the same shorthand.
+
 The required inputs are the public IPv4 address and those three `external:internal` mappings. UDP is not required. The installer cannot create provider-side NAT rules. After the public IP changes, run `update-address` and re-import the subscription or node.
 
 NAT mode serves both the panel and subscription over HTTPS using a ten-year RSA-2048 self-signed certificate whose SAN contains the current IPv4 address. There is no HTTP fallback.

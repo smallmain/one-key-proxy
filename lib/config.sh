@@ -113,9 +113,11 @@ parse_port_map() {
   local value=$1
   local __external=$2
   local __internal=$3
-  local parsed_external parsed_internal extra
-  IFS=: read -r parsed_external parsed_internal extra <<<"$value"
-  [[ -z ${extra:-} && -n $parsed_external && -n $parsed_internal ]] || return 1
+  local default_internal=${4-}
+  local parsed_external parsed_internal
+  [[ $value == *:* ]] || value="${value}:${default_internal}"
+  [[ $value =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  IFS=: read -r parsed_external parsed_internal <<<"$value"
   valid_port "$parsed_external" && valid_port "$parsed_internal" || return 1
   printf -v "$__external" '%s' "$parsed_external"
   printf -v "$__internal" '%s' "$parsed_internal"
@@ -125,15 +127,20 @@ prompt_port_map() {
   local __external=$1
   local __internal=$2
   local label=$3
-  local value external internal
+  local mapping_input external internal default_internal default_mapping=''
+  default_internal=${!__internal}
+  valid_port "$default_internal" || { die '默认内部端口无效。'; return 1; }
+  if valid_port "${!__external}"; then
+    default_mapping="${!__external}:${default_internal}"
+  fi
   while true; do
-    read_tty value "${label}端口映射（外部:内部）" || return 1
-    if parse_port_map "$value" external internal; then
+    read_tty mapping_input "${label}端口映射（外部:内部；内部默认 ${default_internal}，可只填外部端口）" "$default_mapping" || return 1
+    if parse_port_map "$mapping_input" external internal "$default_internal"; then
       printf -v "$__external" '%s' "$external"
       printf -v "$__internal" '%s' "$internal"
       return 0
     fi
-    log_warn '格式无效，请输入类似 56664:2053 的端口映射。'
+    log_warn "端口必须是 1 到 65535 之间的整数，可输入 56664 或 56664:${default_internal}。"
   done
 }
 
@@ -159,11 +166,11 @@ config_generate_defaults() {
   REALITY_TARGET=${OKP_REALITY_TARGET:-$DEFAULT_REALITY_TARGET}
   REALITY_SNI=${REALITY_TARGET%%:*}
   PANEL_EXTERNAL_PORT=''
-  PANEL_INTERNAL_PORT=''
+  PANEL_INTERNAL_PORT=2053
   NODE_EXTERNAL_PORT=''
-  NODE_INTERNAL_PORT=''
+  NODE_INTERNAL_PORT=443
   SUB_EXTERNAL_PORT=''
-  SUB_INTERNAL_PORT=''
+  SUB_INTERNAL_PORT=2096
   FQDN=${OKP_FQDN:-}
   ALI_ACCESS_KEY_ID=${OKP_ALI_ACCESS_KEY_ID:-}
   ALI_ACCESS_KEY_SECRET=${OKP_ALI_ACCESS_KEY_SECRET:-}
@@ -206,17 +213,17 @@ config_collect_public_ip() {
 
 config_collect_nat() {
   if [[ -n ${OKP_PANEL_MAP:-} ]]; then
-    parse_port_map "$OKP_PANEL_MAP" PANEL_EXTERNAL_PORT PANEL_INTERNAL_PORT || { die 'OKP_PANEL_MAP 格式无效。'; return 1; }
+    parse_port_map "$OKP_PANEL_MAP" PANEL_EXTERNAL_PORT PANEL_INTERNAL_PORT "$PANEL_INTERNAL_PORT" || { die 'OKP_PANEL_MAP 格式无效。'; return 1; }
   else
     prompt_port_map PANEL_EXTERNAL_PORT PANEL_INTERNAL_PORT '面板' || return 1
   fi
   if [[ -n ${OKP_NODE_MAP:-} ]]; then
-    parse_port_map "$OKP_NODE_MAP" NODE_EXTERNAL_PORT NODE_INTERNAL_PORT || { die 'OKP_NODE_MAP 格式无效。'; return 1; }
+    parse_port_map "$OKP_NODE_MAP" NODE_EXTERNAL_PORT NODE_INTERNAL_PORT "$NODE_INTERNAL_PORT" || { die 'OKP_NODE_MAP 格式无效。'; return 1; }
   else
     prompt_port_map NODE_EXTERNAL_PORT NODE_INTERNAL_PORT 'VLESS 节点' || return 1
   fi
   if [[ -n ${OKP_SUB_MAP:-} ]]; then
-    parse_port_map "$OKP_SUB_MAP" SUB_EXTERNAL_PORT SUB_INTERNAL_PORT || { die 'OKP_SUB_MAP 格式无效。'; return 1; }
+    parse_port_map "$OKP_SUB_MAP" SUB_EXTERNAL_PORT SUB_INTERNAL_PORT "$SUB_INTERNAL_PORT" || { die 'OKP_SUB_MAP 格式无效。'; return 1; }
   else
     prompt_port_map SUB_EXTERNAL_PORT SUB_INTERNAL_PORT '订阅' || return 1
   fi
@@ -367,7 +374,7 @@ config_summary() {
 }
 
 config_modify() {
-  local choice value new_secret
+  local choice port_input new_secret
   while true; do
     config_summary
     printf '\n可修改项目：\n'
@@ -393,24 +400,24 @@ config_modify() {
         ;;
       4)
         if [[ $MODE == public ]]; then
-          read_tty value '面板 TCP 端口' "$PANEL_EXTERNAL_PORT" || return 1
-          if valid_port "$value"; then PANEL_EXTERNAL_PORT=$value; PANEL_INTERNAL_PORT=$value; else log_warn '端口无效。'; fi
+          read_tty port_input '面板 TCP 端口' "$PANEL_EXTERNAL_PORT" || return 1
+          if valid_port "$port_input"; then PANEL_EXTERNAL_PORT=$port_input; PANEL_INTERNAL_PORT=$port_input; else log_warn '端口无效。'; fi
         else
           prompt_port_map PANEL_EXTERNAL_PORT PANEL_INTERNAL_PORT '面板' || return 1
         fi
         ;;
       5)
         if [[ $MODE == public ]]; then
-          read_tty value 'VLESS TCP 端口' "$NODE_EXTERNAL_PORT" || return 1
-          if valid_port "$value"; then NODE_EXTERNAL_PORT=$value; NODE_INTERNAL_PORT=$value; else log_warn '端口无效。'; fi
+          read_tty port_input 'VLESS TCP 端口' "$NODE_EXTERNAL_PORT" || return 1
+          if valid_port "$port_input"; then NODE_EXTERNAL_PORT=$port_input; NODE_INTERNAL_PORT=$port_input; else log_warn '端口无效。'; fi
         else
           prompt_port_map NODE_EXTERNAL_PORT NODE_INTERNAL_PORT 'VLESS 节点' || return 1
         fi
         ;;
       6)
         if [[ $MODE == public ]]; then
-          read_tty value '订阅 TCP 端口' "$SUB_EXTERNAL_PORT" || return 1
-          if valid_port "$value"; then SUB_EXTERNAL_PORT=$value; SUB_INTERNAL_PORT=$value; else log_warn '端口无效。'; fi
+          read_tty port_input '订阅 TCP 端口' "$SUB_EXTERNAL_PORT" || return 1
+          if valid_port "$port_input"; then SUB_EXTERNAL_PORT=$port_input; SUB_INTERNAL_PORT=$port_input; else log_warn '端口无效。'; fi
         else
           prompt_port_map SUB_EXTERNAL_PORT SUB_INTERNAL_PORT '订阅' || return 1
         fi

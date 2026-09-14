@@ -196,7 +196,7 @@ set_valid_nat_config() {
 
 test_port_mapping_parser() {
   load_config_libraries
-  local external='' internal=''
+  local external='' internal='' invalid
   parse_port_map 56666:2053 external internal
   assert_eq 56666 "$external"
   assert_eq 2053 "$internal"
@@ -204,6 +204,125 @@ test_port_mapping_parser() {
   assert_failure parse_port_map 0:2053 external internal
   assert_failure parse_port_map 56666:65536 external internal
   assert_failure parse_port_map 1:2:3 external internal
+  for invalid in '1:2:' ':2053' '56664:' '56664::2053' '0' '65536' '-1' '22.5' '12345678901234567890' $'56664:2053\n443:443'; do
+    assert_failure parse_port_map "$invalid" external internal 2053
+    assert_eq 56666 "$external"
+    assert_eq 2053 "$internal"
+  done
+  parse_port_map 56664 external internal 2053
+  assert_eq 56664 "$external"
+  assert_eq 2053 "$internal"
+  parse_port_map 60000:8443 external internal 2053
+  assert_eq 60000 "$external"
+  assert_eq 8443 "$internal"
+  assert_failure parse_port_map 56664 external internal 0
+  assert_failure parse_port_map 56664 external internal 65536
+  assert_eq 60000 "$external"
+  assert_eq 8443 "$internal"
+}
+
+stub_port_prompt() {
+  read_tty() {
+    local value
+    ((prompt_count < ${#answers[@]})) || return 1
+    seen_prompts+=("$2")
+    seen_defaults+=("${3-}")
+    value=${answers[$prompt_count]:-${3-}}
+    prompt_count=$((prompt_count + 1))
+    printf -v "$1" '%s' "$value"
+  }
+}
+
+test_port_mapping_prompt_shows_internal_default_and_requires_external() {
+  load_config_libraries
+  local PANEL_EXTERNAL_PORT='' PANEL_INTERNAL_PORT=2053
+  local prompt_count=0
+  local -a answers=('' 0 65536 56664) seen_prompts=() seen_defaults=()
+  stub_port_prompt
+  prompt_port_map PANEL_EXTERNAL_PORT PANEL_INTERNAL_PORT '面板'
+  assert_eq 4 "$prompt_count"
+  assert_eq 56664 "$PANEL_EXTERNAL_PORT"
+  assert_eq 2053 "$PANEL_INTERNAL_PORT"
+  assert_contains "${seen_prompts[0]}" '内部默认 2053'
+  assert_contains "${seen_prompts[0]}" '可只填外部端口'
+  assert_eq '' "${seen_defaults[0]}"
+}
+
+test_port_mapping_prompt_retains_current_mapping_and_custom_internal() {
+  load_config_libraries
+  local NODE_EXTERNAL_PORT='' NODE_INTERNAL_PORT=443
+  local prompt_count=0
+  local -a answers=('56665:8443' 60000 '') seen_prompts=() seen_defaults=()
+  stub_port_prompt
+  prompt_port_map NODE_EXTERNAL_PORT NODE_INTERNAL_PORT 'VLESS 节点'
+  assert_eq 56665 "$NODE_EXTERNAL_PORT"
+  assert_eq 8443 "$NODE_INTERNAL_PORT"
+  assert_contains "${seen_prompts[0]}" '内部默认 443'
+  prompt_port_map NODE_EXTERNAL_PORT NODE_INTERNAL_PORT 'VLESS 节点'
+  assert_eq 60000 "$NODE_EXTERNAL_PORT"
+  assert_eq 8443 "$NODE_INTERNAL_PORT"
+  assert_contains "${seen_prompts[1]}" '内部默认 8443'
+  assert_eq '56665:8443' "${seen_defaults[1]}"
+  prompt_port_map NODE_EXTERNAL_PORT NODE_INTERNAL_PORT 'VLESS 节点'
+  assert_eq 60000 "$NODE_EXTERNAL_PORT"
+  assert_eq 8443 "$NODE_INTERNAL_PORT"
+  assert_eq '60000:8443' "${seen_defaults[2]}"
+}
+
+test_nat_defaults_and_env_maps_accept_external_only() {
+  load_config_libraries
+  OKP_PANEL_USERNAME=tester
+  OKP_PANEL_PASSWORD=a-long-panel-password
+  config_generate_defaults
+  assert_eq '' "$PANEL_EXTERNAL_PORT"
+  assert_eq '' "$NODE_EXTERNAL_PORT"
+  assert_eq '' "$SUB_EXTERNAL_PORT"
+  assert_eq 2053 "$PANEL_INTERNAL_PORT"
+  assert_eq 443 "$NODE_INTERNAL_PORT"
+  assert_eq 2096 "$SUB_INTERNAL_PORT"
+  OKP_PANEL_MAP=56664
+  OKP_NODE_MAP=56665
+  OKP_SUB_MAP=56666
+  read_tty() { fail 'configured mappings must not prompt'; }
+  config_collect_nat
+  assert_eq 56664:2053 "$PANEL_EXTERNAL_PORT:$PANEL_INTERNAL_PORT"
+  assert_eq 56665:443 "$NODE_EXTERNAL_PORT:$NODE_INTERNAL_PORT"
+  assert_eq 56666:2096 "$SUB_EXTERNAL_PORT:$SUB_INTERNAL_PORT"
+}
+
+test_public_port_modification_reads_answers_and_displays_defaults() {
+  load_config_libraries
+  local MODE=public PANEL_EXTERNAL_PORT=2053 PANEL_INTERNAL_PORT=2053
+  local NODE_EXTERNAL_PORT=443 NODE_INTERNAL_PORT=443 SUB_EXTERNAL_PORT=2096 SUB_INTERNAL_PORT=2096
+  local prompt_count=0
+  local -a answers=(4 9443 5 8443 6 '' 0) seen_prompts=() seen_defaults=()
+  stub_port_prompt
+  config_summary() { :; }
+  config_validate() { :; }
+  config_modify >/dev/null
+  assert_eq 9443:9443 "$PANEL_EXTERNAL_PORT:$PANEL_INTERNAL_PORT"
+  assert_eq 8443:8443 "$NODE_EXTERNAL_PORT:$NODE_INTERNAL_PORT"
+  assert_eq 2096:2096 "$SUB_EXTERNAL_PORT:$SUB_INTERNAL_PORT"
+  assert_eq 2053 "${seen_defaults[1]}"
+  assert_eq 443 "${seen_defaults[3]}"
+  assert_eq 2096 "${seen_defaults[5]}"
+}
+
+test_maintenance_public_port_prompt_preserves_defaults_and_accepts_input() {
+  load_config_libraries
+  # shellcheck source=../lib/integration.sh
+  source "$PROJECT_ROOT/lib/integration.sh"
+  local PANEL_EXTERNAL_PORT=2053 PANEL_INTERNAL_PORT=2053
+  local prompt_count=0
+  local -a answers=(65536 9443 '') seen_prompts=() seen_defaults=()
+  stub_port_prompt
+  maintenance_read() { read_tty "$@"; }
+  _okp_i_prompt_public_port PANEL_EXTERNAL_PORT PANEL_INTERNAL_PORT '面板'
+  assert_eq 9443:9443 "$PANEL_EXTERNAL_PORT:$PANEL_INTERNAL_PORT"
+  assert_eq 2053 "${seen_defaults[0]}"
+  _okp_i_prompt_public_port PANEL_EXTERNAL_PORT PANEL_INTERNAL_PORT '面板'
+  assert_eq 9443:9443 "$PANEL_EXTERNAL_PORT:$PANEL_INTERNAL_PORT"
+  assert_eq 9443 "${seen_defaults[2]}"
 }
 
 test_config_accepts_valid_nat_and_public_values() {
@@ -296,6 +415,11 @@ run_test 'state reads reject hard links' test_state_reads_reject_hard_links
 run_test 'abandoned initial state cleanup is conservative' test_abandoned_initial_state_cleanup_is_conservative
 run_test 'state redaction removes secrets' test_redaction_covers_registered_and_structured_secrets
 run_test 'NAT port mappings are strict' test_port_mapping_parser
+run_test 'NAT mapping prompts show defaults and require an external port' test_port_mapping_prompt_shows_internal_default_and_requires_external
+run_test 'NAT mapping edits preserve current values and custom internal ports' test_port_mapping_prompt_retains_current_mapping_and_custom_internal
+run_test 'NAT env mappings accept external ports with service defaults' test_nat_defaults_and_env_maps_accept_external_only
+run_test 'public port edits display defaults and receive terminal values' test_public_port_modification_reads_answers_and_displays_defaults
+run_test 'maintenance port edits validate input and retain current defaults' test_maintenance_public_port_prompt_preserves_defaults_and_accepts_input
 run_test 'valid NAT and public configurations pass' test_config_accepts_valid_nat_and_public_values
 run_test 'invalid and colliding configuration is rejected' test_config_rejects_invalid_and_colliding_values
 run_test 'REALITY TLS probe uses hardened curl and accepts HTTP statuses' test_reality_target_tls_probe_uses_secure_curl_and_accepts_http_errors

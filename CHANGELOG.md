@@ -22,6 +22,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- NAT port prompts show internal defaults and accept external-only input, including dotenv mappings; edits retain the current internal port and allow Enter to keep the current mapping.
 - IPv6-disabled AliDNS deployments remove only owned AAAA records and refuse to continue while any AAAA remains.
 - Stage markers now require an exact stage name and valid completion timestamp; resource-free abandoned initialization state is recovered conservatively.
 - Failed official 3x-ui installation is confined to loopback when possible and otherwise stops x-ui.

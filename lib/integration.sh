@@ -1505,13 +1505,13 @@ _okp_i_port_changed_and_busy() {
 }
 
 _okp_i_prompt_public_port() {
-    local external_name=$1 internal_name=$2 label=$3 current value
+    local external_name=$1 internal_name=$2 label=$3 current port_input
     current=${!external_name}
     while true; do
-        maintenance_read value "${label} TCP 端口" "$current" || return 1
-        if valid_port "$value"; then
-            printf -v "$external_name" '%s' "$value"
-            printf -v "$internal_name" '%s' "$value"
+        maintenance_read port_input "${label} TCP 端口" "$current" || return 1
+        if valid_port "$port_input"; then
+            printf -v "$external_name" '%s' "$port_input"
+            printf -v "$internal_name" '%s' "$port_input"
             return 0
         fi
         log_warn '端口必须是 1 到 65535 之间的整数。'

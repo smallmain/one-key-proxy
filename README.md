@@ -90,7 +90,7 @@ ONE_KEY_PROXY_REF=vX.Y.Z sh bootstrap.sh
 0. 退出
 ```
 
-“安装配置”通过 SSH 安装 VPS，再添加 SublinkPro 和本地配置；进入这一项后，若有未完成流程，会询问继续上次还是重新开始。“添加配置”可选择 SSH 读取已安装 VPS，或者直接输入订阅地址，无需安装服务器。“查看配置”可进入每条配置的详情，查看资源、端口、状态和中转关系，并修改该配置的中转设置或删除它。
+“安装配置”通过 SSH 安装 VPS，再添加 SublinkPro 和本地配置；进入这一项后，若有未完成流程，会询问继续上次还是重新开始。“添加配置”可选择 SSH、订阅地址或单条节点链接。“查看配置”区分机场订阅和独立节点，进入详情后可管理中转、删除资源，独立节点还可编辑名称、链接及本地配置。
 
 ### 本机配置
 
@@ -132,7 +132,7 @@ python3 deploy.py add --subscription-url 'https://your-vps.example/sub/your-toke
   --airport-name "我的机场" --node-name "香港备用" --local-port 7900
 ```
 
-机场名称与节点名称分别自定义。首次未指定时会询问；SSH 来源默认使用 VPS 节点名称，订阅来源默认使用选中的节点名。无需重复填写已完成的名称与端口。旧命令 `sync` 保留为 `add` 的兼容别名。
+机场名称与节点名称分别自定义。首次交互安装/添加会在连接 SSH 或获取订阅之前分别要求填写，每项输入立即保存，不会默认采用 VPS 主机名；安装时显式配置的 `OKP_NODE_NAME` 可作为节点名称默认值。已保存的名称和已受管配置会复用，命令行 `--airport-name` / `--node-name` 优先；续跑不会用旧 VPS 名称覆盖本次指定的名称。无交互终端且首次未指定名称时，仍使用来源节点名称。旧命令 `sync` 保留为 `add` 的兼容别名。
 
 订阅地址支持 HTTP/HTTPS；只添加机场时，由 SublinkPro 解析它支持的订阅格式。启用本地节点时，本机支持明文 URI 列表或 Base64 订阅中的 **VLESS TCP + REALITY + Vision**。多个可用节点时交互选择一条生成本地出站，非交互可用 `--subscription-node 1` 指定序号；恢复时使用连接指纹识别，避免订阅顺序变化选错节点。机场仍保留整个订阅。自签名证书可在向导中选择，或传入 `--insecure-subscription`；重定向地址需填写最终 URL。交互输入地址可避免将订阅令牌写进 Shell 命令历史。
 
@@ -143,6 +143,48 @@ python3 deploy.py add --subscription-url 'https://your-vps.example/sub/your-toke
 安装/SSH 添加向导支持主机密码（默认）、私钥、SSH 配置/agent。SSH 端口留空沿用配置；`--port 2222` 可覆盖。主机别名也受支持。**`--password` 后面不填写密码**，OpenSSH 在终端中确认主机指纹并无回显输入密码，然后复用共享连接上传和读取状态。密码不进入 Python、进程参数、环境变量或临时文件。私钥可用 `--identity ~/.ssh/my_key`，与密码开关互斥。不指定认证参数的直接子命令沿用 SSH 配置/agent。
 
 安装上传当前本机源码（含未提交修改），不要求先 push GitHub。白名单阻止上传 `.env`、Git 历史和 SublinkPro 凭据。AliDNS 等安装默认值经 SSH 输入流送入 root-only 临时文件；VPS 安装器仍保留最终确认页。AliDNS 凭据保存在 VPS 的受保护配置中供续期使用。完成或中断时清理临时文件；断网时可能需要按提示手动清理。
+
+### 单条节点链接
+
+“添加配置 → 单条节点链接”不连接 SSH，也不创建机场。填写链接和节点名称后，选择是否启用本地节点、端口及中转。链接备注可作为名称候选，交互时仍需确认；独立节点不询问机场名称。远端显示名为 `[SM]{节点名称}`，本地显示名为 `[SM]{节点名称} - 本地`。
+
+```bash
+okp add --node-link 'socks5://user:password@proxy.example:1080#MyNode' --no-local-node
+okp add 'vless://UUID@proxy.example:443?security=tls#MyNode' --local-port 7901
+okp add --node-file /absolute/path/private-node.txt --node-name "家宽" --local-port 7902
+```
+
+`okp` 是本机配置的 shell alias；也可将示例中的 `okp` 替换为 `python3 deploy.py`。`--node-file` 要求当前用户拥有的 `0600` 普通文件。交互粘贴或私有文件可避免把链接中的凭据写入 Shell 命令历史。
+
+支持 VLESS、Shadowsocks 和 SOCKS5 链接，添加前调用 SublinkPro 的链接解析接口核验。生成本地 sing-box 出站时，VLESS 支持 TCP/raw、WebSocket、gRPC，以及普通 TLS 或 TCP REALITY（可选 Vision）；Shadowsocks 支持标准分享链接和 sing-box 支持的加密方式，暂不转换 plugin 等扩展；SOCKS5 支持有认证或无认证链接及 IPv6。未知或不支持的本地参数会明确报错，不会忽略；可关闭本地节点，或指定另一条可转换的本地出站链接。
+
+默认本地出站跟随远端链接；家宽这样的“远端 VLESS、本地 SOCKS”可独立指定：
+
+```bash
+okp add --node-file /absolute/path/remote-node.txt --node-name "家宽" \
+  --local-link 'socks5://user:password@proxy.example:26193' --local-port 7902 --via 美国
+okp edit 家宽 --node-link 'vless://UUID@new.example:443?security=tls'
+okp edit 家宽 --same-local
+```
+
+更换远端链接会保留独立本地出站。`--same-local` 才会切回跟随远端；`--local-link` 用于修改独立出站。现有已接管的 SOCKS 家宽会保留原出站参数和中转关系。
+
+在“查看配置 → 独立节点 → 编辑此节点”中，或用 `okp edit <管理ID或节点名称>`，可修改名称、远端链接、本地端口、是否启用本地节点，以及独立出站链接。常用命令：
+
+```bash
+okp edit 家宽 --node-name "美国住宅"
+okp edit 美国住宅 --local-port 7903
+okp edit 美国住宅 --no-local-node
+okp edit 美国住宅 --via 美国
+```
+
+`edit --no-local-node` 会在交互确认后删除配套本地 SS、sing-box 入站/出站/路由，保留远端节点；`add --no-local-node` 仍表示跳过本地修改。被其他本地出站引用时不能关闭。节点作为中转被引用时，改名会同步更新其受管节点的前置代理名称；未受管引用会阻止改名，避免留下断开的引用。既有 sing-box tag 保持稳定，新 Shadowsocks 出站使用 `ss-{名称}-out`。
+
+每个独立节点使用随机、稳定的管理 ID；改名或通过 `edit` 更换地址、密码都保持原配置和资源 ID。连接指纹忽略备注与查询参数顺序，用于重复添加识别；不同连接请通过 `edit` 指定原配置，而不是通过 `add` 猜测关联。未受管的同连接节点需要显式 `--adopt-node <节点ID>`，或在向导中确认接管；属于机场的节点不能直接改成独立节点。
+
+清单中独立节点的 `airport_id` 为 `null`、`airport_name` 为空，通过 `remote_node_id` 定位。新增记录为 `kind=node`，接管记录仍为 `kind=adopted`。`local_source=remote/custom` 表示本地出站来源，`remote_fingerprints` 只保存连接摘要。旧清单会兼容读取并保留原 ID。
+
+变更前验证链接、冲突和候选 sing-box 配置，再写入私有 `node-change-*.json` 事务记录；部分成功后可用 `okp --resume`，或进入该节点继续变更。事务完成前不能用新参数替换它，也不能删除或另行改中转。外部修改会使恢复停止。成功后清除活动事务，修改已有资源的 `node-backup-*.json` 和 sing-box 备份保留供核验。这些备份含敏感参数，均为 `0600` 且被 Git 忽略。恢复文件可能暂存节点链接，`managed.json` 不保存完整链接或密码。
 
 ### 更新与未完成流程
 

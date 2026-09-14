@@ -42,6 +42,14 @@ def atomic_write(path, content):
             os.unlink(temporary)
 
 
+def is_standalone(record):
+    return record.get("kind") == "node" or (record.get("airport_id") is None and record.get("remote_node_id") is not None)
+
+
+def configuration_label(record):
+    return record["node_name"] if is_standalone(record) else f"{record['airport_name']} / {record['node_name']}"
+
+
 class ManagedDeployments:
     def __init__(self, state):
         self.state = state
@@ -63,21 +71,35 @@ class ManagedDeployments:
             if set(document) != {"version", "deployments"} or document["version"] != 1:
                 raise ValueError
             self.records = document["deployments"]
-            if isinstance(self.records, dict):
-                for record in self.records.values():
-                    if isinstance(record, dict):
-                        record.setdefault("kind", "deployment")
-                        record.setdefault("remote_node_id", None)
-                        record.setdefault("relay_id", None)
+            self.migrate()
             self.validate()
         except (ValueError, TypeError, KeyError):
             raise DeployError("受管部署清单无效，请检查 .deploy-state/managed.json。") from None
+
+    def migrate(self):
+        if not isinstance(self.records, dict):
+            return
+        for record in self.records.values():
+            if not isinstance(record, dict):
+                continue
+            record.setdefault("kind", "deployment")
+            record.setdefault("remote_node_id", None)
+            record.setdefault("relay_id", None)
+            box = record.get("singbox") or {}
+            if not isinstance(box, dict):
+                raise ValueError("invalid sing-box metadata")
+            record.setdefault("local_source", "custom" if record["kind"] == "adopted" and
+                              box.get("outbound_tag", "").startswith("socks-") else "remote")
+            record.setdefault("remote_fingerprints", [])
+            if is_standalone(record):
+                record["airport_name"] = ""
 
     def validate(self):
         if not isinstance(self.records, dict):
             raise ValueError
         allowed = {"target", "env_file", "sublink_url", "airport_id", "local_node_id", "airport_name",
-                   "node_name", "local_port", "singbox", "status", "kind", "remote_node_id", "relay_id"}
+                   "node_name", "local_port", "singbox", "status", "kind", "remote_node_id", "relay_id",
+                   "remote_fingerprints", "local_source"}
         for identity, record in self.records.items():
             if not re.fullmatch(r"[0-9a-f]{32}", identity) or not isinstance(record, dict) or set(record) != allowed:
                 raise ValueError
@@ -86,7 +108,10 @@ class ManagedDeployments:
                     raise ValueError
             if not Path(record["env_file"]).is_absolute() or not record["target"] or not record["sublink_url"]:
                 raise ValueError
-            if record["status"] not in ("syncing", "active", "deleting", "adopting", "relaying") or record["kind"] not in ("deployment", "adopted", "subscription"):
+            if record["status"] not in ("syncing", "active", "deleting", "adopting", "relaying", "updating") or record["kind"] not in ("deployment", "adopted", "subscription", "node"):
+                raise ValueError
+            if (record["local_source"] not in ("remote", "custom") or not isinstance(record["remote_fingerprints"], list)
+                    or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v) for v in record["remote_fingerprints"])):
                 raise ValueError
             if record["relay_id"] is not None and not re.fullmatch(r"[0-9a-f]{32}", record["relay_id"]):
                 raise ValueError
@@ -102,6 +127,7 @@ class ManagedDeployments:
 
     def save(self):
         try:
+            self.migrate()
             self.validate()
         except (ValueError, TypeError, KeyError):
             raise DeployError("受管部署清单包含无效数据，未保存。") from None
@@ -111,7 +137,7 @@ class ManagedDeployments:
     def register(self, identity, target, env_file, sublink_url, name):
         identity = identity.lower()
         existing = self.records.get(identity)
-        if existing and (existing["sublink_url"] != sublink_url or existing["status"] in ("deleting", "adopting", "relaying")):
+        if existing and (existing["sublink_url"] != sublink_url or existing["status"] in ("deleting", "adopting", "relaying", "updating")):
             raise DeployError("此部署已绑定其他 SublinkPro 地址或正在删除，拒绝重新登记。")
         if not existing:
             self.records[identity] = {"target": target, "env_file": str(env_file), "sublink_url": sublink_url,
@@ -186,7 +212,9 @@ class SingBox:
     @staticmethod
     def named_tags(name, protocol="vless"):
         name = re.sub(r"[^\w.-]+", "-", name).strip("-.")
-        if not name or len(name) > 100 or protocol not in ("vless", "socks"):
+        if protocol == "shadowsocks":
+            protocol = "ss"
+        if not name or len(name) > 100 or protocol not in ("vless", "socks", "ss"):
             raise DeployError("节点名称不能生成有效的 sing-box tag。")
         return f"ss-{name}-in", f"{protocol}-{name}-out"
 
@@ -199,7 +227,7 @@ class SingBox:
         legacy = metadata["inbound_tag"] == inbound and metadata["outbound_tag"] == outbound
         named = (metadata.get("owner_id") == identity and
                  re.fullmatch(r"ss-[\w.-]+-in", metadata["inbound_tag"]) and
-                 re.fullmatch(r"(?:vless|socks)-[\w.-]+-out", metadata["outbound_tag"]))
+                 re.fullmatch(r"(?:vless|socks|ss)-[\w.-]+-out", metadata["outbound_tag"]))
         if (not (legacy or named)
                 or not Path(metadata["config_file"]).is_absolute() or type(metadata["needs_reload"]) is not bool
                 or set(metadata["hashes"]) != {"inbound", "outbound", "rule"}):
@@ -339,7 +367,8 @@ class SingBox:
             raise DeployError("其他 sing-box 配置仍引用此部署，需先解除共享/链式引用。")
         return remainder
 
-    def plan(self, identity, vless_link=None, ss_link=None, metadata=None, remove=False, name=None, relay_tag=None):
+    def plan(self, identity, vless_link=None, ss_link=None, metadata=None, remove=False, name=None, relay_tag=None,
+             outbound_config=None):
         original, document = self.read()
         candidate = self.owned(document, identity, metadata, allow_references=not remove)
         if metadata and metadata["needs_reload"] and Path(metadata["backup_file"]).exists():
@@ -350,8 +379,9 @@ class SingBox:
                 raise DeployError("未完成事务的 sing-box 备份无效，请先核验备份。") from None
             if previous_remainder != candidate:
                 raise DeployError("未完成事务后，其他 sing-box 配置发生变化；请先核验，避免回滚覆盖手动修改。")
+        protocol = outbound_config.get("type", "vless") if outbound_config else "vless"
         inbound_tag, outbound_tag = ((metadata["inbound_tag"], metadata["outbound_tag"]) if metadata else
-                                     self.named_tags(name) if name else self.tags(identity))
+                                     self.named_tags(name, protocol) if name else self.tags(identity))
         if remove:
             if metadata is None:
                 raise DeployError("缺少 sing-box 所有权记录。")
@@ -362,12 +392,17 @@ class SingBox:
             if any(i.get("listen_port") == port for i in candidate["inbounds"]):
                 raise DeployError("本地端口已被其他 sing-box 入站使用。")
             inbound.update(tag=inbound_tag, listen_port=port, method=method, password=password)
-            outbound = self.vless(outbound, vless_link)
+            outbound = copy.deepcopy(outbound_config) if outbound_config is not None else self.vless(outbound, vless_link)
+            if outbound.get("type") not in ("vless", "socks", "shadowsocks"):
+                raise DeployError("本地出站协议不受支持。")
+            outbound.pop("detour", None)
             outbound["tag"] = outbound_tag
             if relay_tag:
                 if relay_tag == outbound_tag or not any(o["tag"] == relay_tag for o in candidate["outbounds"]):
                     raise DeployError("sing-box 中转出站不存在或指向自身。")
                 outbound["detour"] = relay_tag
+            if any(i["tag"] == inbound_tag for i in candidate["inbounds"]) or any(o["tag"] == outbound_tag for o in candidate["outbounds"]):
+                raise DeployError("节点名称对应的 sing-box 标签已存在。")
             rule = {"inbound": [inbound_tag], "action": "route", "outbound": outbound_tag}
             candidate["inbounds"].append(inbound)
             candidate["outbounds"].append(outbound)

@@ -128,6 +128,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/smallmain/one-key-proxy/main/
 
 ### 5.2 共用参数
 
+单条节点链接作为独立来源进入“添加配置”，不创建机场或连接 SSH。新增清单类型 `kind=node`；无机场的旧接管记录继续使用原 ID 和 `kind=adopted`，显示为独立节点，机场名称清空。`remote_node_id`、所有权标记与连接摘要绑定远端资源；`local_source=remote/custom` 区分跟随远端与独立本地出站。单节点编辑使用 `node-change-*.json` 保存完整变更意图和 API 前后快照，在所有步骤成功后删除活动事务，已有资源快照保留为私有备份。候选配置先检查，再回读核验 API 和原子应用 sing-box，外部修改拒绝覆盖。名称、链接和本地节点管理位于配置详情，中转名称变化只自动传播到已受管的引用，未受管引用阻止操作。
+
 | 参数 | 默认或来源 | 校验 |
 | --- | --- | --- |
 | 部署模式 | 必选 | `nat` 或 `public` |

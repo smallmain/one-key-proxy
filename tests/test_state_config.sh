@@ -272,7 +272,7 @@ test_port_mapping_prompt_retains_current_mapping_and_custom_internal() {
 test_nat_defaults_and_env_maps_accept_external_only() {
   load_config_libraries
   OKP_PANEL_USERNAME=tester
-  OKP_PANEL_PASSWORD=a-long-panel-password
+  OKP_PANEL_PASSWORD='a-long-panel-password'
   config_generate_defaults
   assert_eq '' "$PANEL_EXTERNAL_PORT"
   assert_eq '' "$NODE_EXTERNAL_PORT"

@@ -591,8 +591,8 @@ xui_validate_api_token() {
     declare -g XUI_VALIDATED_API_TOKEN_NAME="$expected_name"
 }
 
-# Create one dedicated full-admin token. 3x-ui makes every API token full-admin
-# and returns plaintext exactly once; it is retained only in the secret global.
+# Create a dedicated admin token; v3.7 adds scopes while v3.6 ignores the field.
+# Plaintext is returned once and retained only in the secret global.
 xui_create_api_token() {
     local name payload created id returned_name token enabled LC_ALL=C
     [[ $# -eq 1 ]] || return 2
@@ -601,7 +601,7 @@ xui_create_api_token() {
         _xui_error 'API token name must contain 1-64 characters on one line'
         return 2
     }
-    payload=$(jq -nc --arg name "$name" '{name: $name}') || return 1
+    payload=$(jq -nc --arg name "$name" '{name: $name, scope: "admin"}') || return 1
     created=$(xui_api_post /panel/api/setting/apiTokens/create "$payload") || return 1
     id=$(jq -r '.id // empty' <<< "$created")
     returned_name=$(jq -r '.name // empty' <<< "$created")
@@ -625,7 +625,7 @@ xui_create_api_token() {
     if ! xui_validate_api_token "$token" "$id" "$returned_name"; then
         # The installer token is still active here, so roll back the unusable
         # row and leave the current authentication context untouched.
-        if ! xui_api_post "/panel/api/setting/apiTokens/delete/$id" '{}' > /dev/null; then
+        if ! xui_api_post "/panel/api/setting/apiTokens/delete/$id" '{"expectedScope":"admin"}' > /dev/null; then
             if declare -F log_warn > /dev/null 2>&1; then
                 log_warn "无法清理验证失败的 API Token 行 ID=$id"
             fi
@@ -738,7 +738,7 @@ xui_delete_api_token_by_id() {
         _xui_error "API token ID=$id does not match the expected name"
         return 1
     fi
-    xui_api_post "/panel/api/setting/apiTokens/delete/$id" '{}' > /dev/null || return 1
+    xui_api_post "/panel/api/setting/apiTokens/delete/$id" '{"expectedScope":"admin"}' > /dev/null || return 1
     xui_api_tokens_read || return 1
     remaining=$(jq -r --argjson id "$id" 'any(.[]; .id == $id)' <<< "$XUI_API_TOKENS_JSON") || return 1
     [[ $remaining == false ]] || {
@@ -859,7 +859,7 @@ xui_recover_pending_api_token() {
     if ((count == 1)); then
         candidate_id=$(jq -r '.[0].id // empty' <<< "$matches")
         [[ $candidate_id =~ ^[1-9][0-9]*$ ]] || return 1
-        xui_api_post "/panel/api/setting/apiTokens/delete/$candidate_id" '{}' > /dev/null || return 1
+        xui_api_post "/panel/api/setting/apiTokens/delete/$candidate_id" '{"expectedScope":"admin"}' > /dev/null || return 1
         xui_api_tokens_read || return 1
         remaining=$(jq -r --argjson id "$candidate_id" --arg name "$pending_name" '
             any(.[]; .id == $id or .name == $name)

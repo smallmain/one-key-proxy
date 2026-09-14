@@ -136,6 +136,85 @@ class SubscriptionTests(unittest.TestCase):
                 subscriptions.local_candidates(raw)
 
 
+class NamingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        patcher = patch.object(deploy, "ROOT", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state = deploy.ResumeState()
+        self.args = argparse.Namespace(action="install", target="root@host", env_file=self.root / ".env",
+                                       source=None, airport_name=None, name=None)
+
+    def test_names_are_required_and_each_answer_is_saved(self):
+        with self.state.locked():
+            self.state.start("install", self.args.env_file)
+            with patch("builtins.input", side_effect=["", "Airport", KeyboardInterrupt]), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                deploy.configure_resource_names(self.args, fixtures.CONFIG, self.state, True)
+            self.assertEqual(self.state.load()["options"]["airport_name"], "Airport")
+            self.assertNotIn("name", self.state.data["options"])
+            with patch("builtins.input", return_value="Node") as prompt:
+                deploy.configure_resource_names(self.args, fixtures.CONFIG, self.state, True)
+            self.assertEqual(prompt.call_count, 1)
+            self.assertEqual(prompt.call_args.args[0], "节点名称: ")
+            self.assertEqual(self.state.load()["options"]["name"], "Node")
+
+    def test_existing_names_are_reused_and_explicit_names_take_precedence(self):
+        with self.state.locked():
+            registry = deploy.ManagedDeployments(self.state)
+            registry.register("a" * 32, self.args.target, self.args.env_file, fixtures.CONFIG["SUBLINKPRO_URL"], "Saved node")
+            registry.update("a" * 32, airport_name="Saved airport", status="active")
+            self.state.start("install", self.args.env_file)
+            self.args.name = "Explicit node"
+            with patch("builtins.input", side_effect=AssertionError("must reuse known names")):
+                deploy.configure_resource_names(self.args, fixtures.CONFIG, self.state, True)
+            self.assertIsNone(self.args.airport_name)
+            self.assertNotIn("airport_name", self.state.data["options"])
+            self.assertEqual(self.args.name, "Explicit node")
+
+    def test_installation_collects_names_before_ssh_and_keeps_them_after_export(self):
+        def connected():
+            options = self.state.load()["options"]
+            self.assertEqual((options["airport_name"], options["name"]), ("Airport", "Custom node"))
+
+        with patch.object(deploy, "read_env", return_value=fixtures.CONFIG.copy()), \
+                patch.object(deploy.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", side_effect=["Airport", "Custom node"]), \
+                patch.object(deploy, "SSH") as ssh, patch.object(deploy, "install") as install, \
+                patch.object(deploy, "export_node", return_value=fixtures.NODE), \
+                patch.object(deploy.SublinkPro, "sync", return_value="done") as sync, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ssh.return_value.connect.side_effect = connected
+            deploy.main(["install", "root@host", "--no-local-node"])
+        self.assertEqual(install.call_args.args[1]["OKP_NODE_NAME"], "Custom node")
+        self.assertEqual(sync.call_args.kwargs["airport_name"], "Airport")
+        self.assertEqual(sync.call_args.kwargs["node_name"], "Custom node")
+        self.assertNotEqual(sync.call_args.kwargs["node_name"], fixtures.NODE["NODE_NAME"])
+        self.assertFalse(self.state.path.exists())
+
+    def test_cancelling_name_entry_never_connects_or_installs(self):
+        with patch.object(deploy, "read_env", return_value=fixtures.CONFIG.copy()), \
+                patch.object(deploy.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", side_effect=["Airport", KeyboardInterrupt]), \
+                patch.object(deploy, "SSH") as ssh, patch.object(deploy, "install") as install, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            deploy.main(["install", "root@host", "--no-local-node"])
+        ssh.assert_not_called()
+        install.assert_not_called()
+        self.assertEqual(self.state.load()["options"]["airport_name"], "Airport")
+
+    def test_invalid_explicit_name_is_rejected_before_ssh(self):
+        with patch.object(deploy, "read_env", return_value=fixtures.CONFIG.copy()), \
+                patch.object(deploy.sys.stdin, "isatty", return_value=False), \
+                patch.object(deploy, "SSH") as ssh, contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(deploy.DeployError):
+            deploy.main(["add", "root@host", "--no-local-node", "--airport-name", "x" * 81, "--node-name", "Node"])
+        ssh.assert_not_called()
+
+
 class SubscriptionWorkflowTests(unittest.TestCase):
     setUp = fixtures.SublinkTests.setUp
     cleanup = fixtures.SublinkTests.cleanup

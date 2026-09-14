@@ -205,14 +205,14 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
 
     def test_password_login_requires_a_terminal(self):
-        with patch.object(deploy, "read_env", return_value=CONFIG), \
+        with patch.object(deploy, "read_env", return_value=dict(CONFIG)), \
                 patch.object(deploy.sys.stdin, "isatty", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
             deploy.main(["sync", "root@host", "--password"])
         self.assertEqual(error.exception.code, 2)
 
     def test_authentication_failure_prevents_upload_and_export(self):
-        with patch.object(deploy, "read_env", return_value=CONFIG), \
+        with patch.object(deploy, "read_env", return_value=dict(CONFIG)), \
                 patch.object(deploy.sys.stdin, "isatty", return_value=True), \
                 patch.object(deploy.shutil, "which", return_value="/usr/bin/ssh"), \
                 patch.object(deploy, "SSH") as ssh_class, patch.object(deploy, "install") as install, \
@@ -490,7 +490,7 @@ class ResumeTests(unittest.TestCase):
         self.seed(target="root@host", password=False, auth_method="auto", create_local_node=False, no_sync=True)
         with self.state.locked():
             self.state.phase("sync", NODE["INSTALLATION_ID"])
-        with patch.object(deploy, "read_env", return_value=CONFIG), patch.object(deploy, "SSH") as ssh, \
+        with patch.object(deploy, "read_env", return_value=dict(CONFIG)), patch.object(deploy, "SSH") as ssh, \
                 patch.object(deploy.shutil, "which", return_value="ssh"), patch.object(deploy, "install") as install, \
                 patch.object(deploy, "export_node", return_value=NODE), contextlib.redirect_stdout(io.StringIO()):
             deploy.main(["--resume"])
@@ -504,36 +504,34 @@ class ResumeTests(unittest.TestCase):
             kwargs["on_input"](airport_name="Saved airport", name="Saved node", local_port=7900)
             raise deploy.DeployError("API unavailable")
 
-        with patch.object(deploy, "read_env", return_value=CONFIG), patch.object(deploy, "SSH"), \
+        with patch.object(deploy, "read_env", return_value=dict(CONFIG)), patch.object(deploy, "SSH"), \
                 patch.object(deploy.sys.stdin, "isatty", return_value=True), \
                 patch.object(deploy.shutil, "which", return_value="ssh"), patch.object(deploy, "install") as install, \
                 patch.object(deploy, "export_node", return_value=NODE), \
-                patch.object(deploy, "SublinkPro") as client_class, contextlib.redirect_stdout(io.StringIO()), \
+                patch.object(deploy.SublinkPro, "sync") as sync, contextlib.redirect_stdout(io.StringIO()), \
+                patch("builtins.input", side_effect=["Initial airport", "Initial node"]), \
                 patch.object(deploy, "SingBox"), \
                 contextlib.redirect_stderr(io.StringIO()):
-            client = client_class.return_value
-            client.create_local_node = True
-            client.url = CONFIG["SUBLINKPRO_URL"]
-            client.sync.side_effect = failed_sync
+            sync.side_effect = failed_sync
             with self.assertRaises(deploy.DeployError):
                 deploy.main(["install", "root@host"])
             saved = self.state.load()
             self.assertEqual(saved["phase"], "sync")
             self.assertEqual(saved["installation_id"], NODE["INSTALLATION_ID"])
-            client.sync.side_effect = None
-            client.sync.return_value = "synced"
+            sync.side_effect = None
+            sync.return_value = "synced"
             deploy.main(["--resume"])
             self.assertEqual(install.call_count, 1)
-            self.assertEqual(client.sync.call_args.kwargs["airport_name"], "Saved airport")
-            self.assertEqual(client.sync.call_args.kwargs["node_name"], "Saved node")
-            self.assertEqual(client.sync.call_args.kwargs["local_port"], 7900)
+            self.assertEqual(sync.call_args.kwargs["airport_name"], "Saved airport")
+            self.assertEqual(sync.call_args.kwargs["node_name"], "Saved node")
+            self.assertEqual(sync.call_args.kwargs["local_port"], 7900)
         self.assertFalse(self.state.path.exists())
 
     def test_changed_vps_identity_stops_before_sync_and_keeps_record(self):
         self.seed(target="root@host", password=False, auth_method="auto", create_local_node=False)
         with self.state.locked():
             self.state.phase("sync", NODE["INSTALLATION_ID"])
-        with patch.object(deploy, "read_env", return_value=CONFIG), patch.object(deploy, "SSH"), \
+        with patch.object(deploy, "read_env", return_value=dict(CONFIG)), patch.object(deploy, "SSH"), \
                 patch.object(deploy.shutil, "which", return_value="ssh"), patch.object(deploy, "install") as install, \
                 patch.object(deploy, "export_node", return_value=dict(NODE, INSTALLATION_ID="b" * 32)), \
                 patch.object(deploy.SublinkPro, "sync") as sync, contextlib.redirect_stdout(io.StringIO()), \
@@ -588,6 +586,13 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             search = urllib.parse.parse_qs(parsed.query).get("search", [""])[0]
             data = [node for node in state["nodes"] + [state["ss_template"]]
                     if search in node["Name"] or search in urllib.parse.unquote(node["Link"])]
+        elif self.command == "GET" and path == "/api/v1/nodes/parse-link":
+            from deploy_links import parse_node_link
+            try:
+                link = parse_node_link(urllib.parse.parse_qs(parsed.query)["link"][0])
+                data = {"protocol": link.protocol, "fields": {"Server": link.host, "Port": link.port}}
+            except deploy.DeployError:
+                code = 500
         elif self.command == "GET" and path == "/api/v1/tags/node/tags":
             node_id = int(urllib.parse.parse_qs(parsed.query)["nodeId"][0])
             data = [{"name": name} for name in state["tags"].get(node_id, [])]
@@ -595,12 +600,16 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             for node in state["nodes"]:
                 if node["ID"] in fields["ids"]:
                     node["DialerProxyName"] = fields["dialerProxyName"]
+            if state.pop("fail_dialer_once", False):
+                code = 500
         elif self.command == "POST" and path in ("/api/v1/nodes/add", "/api/v1/nodes/update"):
             if not state.get("skip_local"):
                 existing = next((n for n in state["nodes"] if n["Link"] == fields.get("oldlink")), None)
                 node_id = existing["ID"] if existing else max([917] + [n["ID"] for n in state["nodes"]]) + 1
                 node = dict(SS_TEMPLATE, ID=node_id, Name=fields["name"], Link=fields["link"],
                             NameMode=fields["nameMode"], Group=fields["group"], DialerProxyName=fields["dialerProxyName"])
+                uri = urllib.parse.urlsplit(fields["link"])
+                node.update(Protocol=uri.scheme, LinkHost=uri.hostname, LinkPort=uri.port)
                 if existing:
                     existing.update(node)
                 else:
@@ -608,11 +617,15 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                 state["tags"][node_id] = fields["tags"].split(",") if fields["tags"] else []
             if state.pop("fail_after_local_write", False):
                 code = 500
+            if "okp-remote" in fields["link"] and state.pop("fail_remote_once", False):
+                code = 500
         elif self.command == "POST" and re.fullmatch(r"/api/v1/airports/\d+/pull", path):
             pass
         elif self.command == "DELETE" and path == "/api/v1/nodes/delete":
             node_id = int(urllib.parse.parse_qs(parsed.query)["id"][0])
             state["nodes"] = [node for node in state["nodes"] if node["ID"] != node_id]
+            if state.pop("fail_node_delete_once", False):
+                code = 500
         elif self.command == "DELETE" and re.fullmatch(r"/api/v1/airports/\d+", path):
             airport_id = int(path.rsplit("/", 1)[1])
             if urllib.parse.parse_qs(parsed.query).get("deleteNodes") == ["true"]:
@@ -1003,7 +1016,7 @@ class SublinkTests(unittest.TestCase):
             client.url = self.client.url
             return original_request(client, *args, **kwargs)
 
-        with patch.object(deploy, "read_env", return_value=CONFIG), \
+        with patch.object(deploy, "read_env", return_value=dict(CONFIG)), \
                 patch.object(deploy.SublinkPro, "request", fixture_request), patch.object(deploy, "SSH") as ssh, \
                 contextlib.redirect_stdout(io.StringIO()):
             deploy.main(["relay", "Child", "--via", "Parent"])

@@ -721,6 +721,7 @@ test_api_token_creation_validates_one_time_secret() {
   : >"$audit"
   secret_register() { printf 'secret\t%s\n' "$1" >>"$audit"; }
   xui_api_post() {
+    assert_jq '.scope == "admin"' "$2" || return 1
     printf 'post\t%s\t%s\n' "$1" "${2-}" >>"$audit"
     printf '%s\n' '{"id":12,"name":"managed-token","token":"new-token-value","enabled":true}'
   }
@@ -734,7 +735,7 @@ test_api_token_creation_validates_one_time_secret() {
   assert_eq new-token-value "$XUI_CREATED_API_TOKEN_VALUE"
   local calls
   calls=$(<"$audit")
-  assert_contains "$calls" $'post\t/panel/api/setting/apiTokens/create\t{"name":"managed-token"}'
+  assert_contains "$calls" $'post\t/panel/api/setting/apiTokens/create\t{"name":"managed-token","scope":"admin"}'
   assert_contains "$calls" $'secret\tnew-token-value'
   assert_contains "$calls" $'validate\tnew-token-value\t12\tmanaged-token'
 }
@@ -791,6 +792,7 @@ test_api_token_delete_binds_id_to_expected_name() {
     fi
   }
   xui_api_post() {
+    assert_jq '.expectedScope == "admin"' "$2" || return 1
     printf '%s\t%s\n' "$1" "${2-}" >>"$audit"
     printf '%s\n' '{}'
   }
@@ -800,7 +802,7 @@ test_api_token_delete_binds_id_to_expected_name() {
 
   reads=0
   xui_delete_api_token_by_id 7 old-managed-token
-  assert_eq $'/panel/api/setting/apiTokens/delete/7\t{}' "$(<"$audit")"
+  assert_eq $'/panel/api/setting/apiTokens/delete/7\t{"expectedScope":"admin"}' "$(<"$audit")"
   assert_eq 7 "$XUI_DELETED_API_TOKEN_ID"
   assert_eq old-managed-token "$XUI_DELETED_API_TOKEN_NAME"
   assert_failure xui_delete_api_token_by_id 22 old-managed-token
@@ -853,7 +855,7 @@ test_pending_api_token_orphan_cleanup_is_exact_and_verified() {
   configure_orphan_cleanup_mocks
 
   xui_cleanup_pending_api_token_orphan
-  assert_eq $'post:/panel/api/setting/apiTokens/delete/31:{}\nunset:XUI_PENDING_API_TOKEN_NAME XUI_PENDING_API_TOKEN_OLD_ID XUI_PENDING_API_TOKEN_OLD_NAME' "$(<"$ORPHAN_AUDIT")"
+  assert_eq $'post:/panel/api/setting/apiTokens/delete/31:{"expectedScope":"admin"}\nunset:XUI_PENDING_API_TOKEN_NAME XUI_PENDING_API_TOKEN_OLD_ID XUI_PENDING_API_TOKEN_OLD_NAME' "$(<"$ORPHAN_AUDIT")"
   assert_eq 31 "$XUI_CLEANED_ORPHAN_API_TOKEN_ID"
   assert_eq one-key-proxy-pending-abc "$XUI_CLEANED_ORPHAN_API_TOKEN_NAME"
   assert_eq 2 "$ORPHAN_READS" 'orphan cleanup must verify deletion with a second list read'

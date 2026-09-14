@@ -112,6 +112,8 @@ def prepare_adoption(client, box, registry, manifest, env_file):
                              "airport_id": group["airport_id"], "local_node_id": group["local_node_id"],
                              "remote_node_id": group["remote_node_id"], "airport_name": airport_name, "node_name": name,
                              "local_port": port, "kind": "adopted", "status": "adopting", "singbox": None,
+                             "local_source": "custom" if outbound["type"] == "socks" else "remote",
+                             "remote_fingerprints": [],
                              "relay_id": identities[relay] if relay else None}
     try:
         tuple(graphlib.TopologicalSorter({key: [r["relay_id"]] if r["relay_id"] else [] for key, r in records.items()}).static_order())

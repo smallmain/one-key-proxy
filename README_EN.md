@@ -90,7 +90,7 @@ The Chinese management menu returns after each operation:
 0. 退出 (Exit)
 ```
 
-Install sets up a VPS over SSH and adds its resources. An unfinished workflow is offered for resume or restart after entering Install/Add. Add supports either reading an installed VPS over SSH or entering a subscription URL directly. View opens each configuration's details, including local ports, resources, status, and its relay setting; relay editing belongs to that configuration.
+Install sets up a VPS over SSH and adds its resources. An unfinished workflow is offered for resume or restart after entering Install/Add. Add supports SSH, subscription URLs, or a single node link. View distinguishes airports from standalone nodes; standalone details also provide name, link and local-node editing. Relay editing belongs to each configuration.
 
 ### Local configuration
 
@@ -129,7 +129,7 @@ python3 deploy.py add 'https://your-vps.example/sub/your-token' --no-local-node
 python3 deploy.py add --subscription-url 'https://your-vps.example/sub/your-token' --airport-name "My airport" --node-name "Hong Kong" --local-port 7900
 ```
 
-Airport and node names are independently configurable. First import prompts for missing values, defaulting to the VPS or selected subscription node name. Noninteractive runs use defaults. `--name` aliases `--node-name`; the old `sync` command remains an alias for `add`.
+Airport and node names are independently configurable. First interactive imports require both names before SSH or subscription fetching, checkpointing each answer immediately without defaulting to the VPS hostname. An explicit `OKP_NODE_NAME` may provide the installation node-name default. Saved and managed names are reused; explicit flags take precedence, including when a resumed VPS still exports an older name. Noninteractive first imports retain source-name defaults when names are omitted. `--name` aliases `--node-name`; the old `sync` command remains an alias for `add`.
 
 HTTP/HTTPS subscription URLs are supported. For airport-only imports, SublinkPro handles its supported formats. Creating a local outbound requires a plain URI list or Base64 subscription containing **VLESS TCP + REALITY + Vision**. Choose one compatible node interactively when there are several, or pass `--subscription-node 1`. Resume stores its connection fingerprint so reordering cannot select another node. The airport retains the whole subscription. Self-signed certificates require the wizard option or `--insecure-subscription`; redirects require entering the final URL. Interactive URL input avoids putting access tokens in shell history.
 
@@ -140,6 +140,47 @@ Companion nodes are named `[SM]{node name} - 本地` and connect to `127.0.0.1:l
 The SSH wizard supports host password (default), private key, or SSH configuration/agent. A blank port retains SSH defaults; override with `--port 2222`. Host aliases are supported. **Do not put a password after `--password`**: OpenSSH performs host verification and hidden terminal authentication, then reuses a shared connection. Passwords never enter Python, process arguments, environment variables, or temporary files. `--identity ~/.ssh/my_key` selects a private key and conflicts with password mode. Direct commands without authentication flags retain SSH configuration/agent behavior.
 
 Install uploads local runtime sources, including uncommitted edits, without requiring a GitHub push. An allowlist excludes `.env`, Git history and SublinkPro credentials. AliDNS and installation defaults cross SSH stdin into a root-only temporary file; the VPS installer retains its confirmation page. AliDNS credentials remain in protected VPS configuration for renewal. Temporary files are cleaned up on completion/interruption, with manual cleanup potentially needed after a disconnect.
+
+### Single node links
+
+Choose Add → Single node link. This creates a manual remote node in SublinkPro without SSH or an airport. The wizard collects the link, node name, local-node setting, local port and relay. A link remark can be a name suggestion, confirmed interactively. Names are `[SM]{name}` for the remote node and `[SM]{name} - 本地` for the companion local node.
+
+```bash
+okp add --node-link 'socks5://user:password@proxy.example:1080#MyNode' --no-local-node
+okp add --node-file /absolute/path/private-node.txt --node-name "Home" --local-port 7901
+```
+
+`okp` is a locally configured shell alias; `python3 deploy.py` works without it. `--node-file` requires a user-owned `0600` regular file. Interactive input and private files avoid storing credentials in shell history.
+
+VLESS, Shadowsocks and SOCKS5 are supported and checked against SublinkPro's link parser. Local VLESS conversion supports TCP/raw, WebSocket, gRPC, plain TLS, and TCP REALITY with optional Vision. Shadowsocks supports standard share formats and ciphers accepted by the sing-box binary; plugin extensions are not converted locally. SOCKS5 supports optional credentials and IPv6. Unsupported local parameters fail explicitly; use airport-independent remote storage alone or provide a supported local outbound.
+
+The local outbound normally follows the remote link. A separate local link preserves combinations such as a VLESS remote node with a SOCKS residential exit:
+
+```bash
+okp add --node-file /absolute/path/remote-node.txt --node-name "Home" \
+  --local-link 'socks5://user:password@proxy.example:26193' --local-port 7902 --via US
+okp edit Home --node-link 'vless://UUID@new.example:443?security=tls'
+okp edit Home --same-local
+```
+
+Changing the remote link preserves a custom local outbound. `--local-link` changes that outbound; `--same-local` explicitly returns to following the remote. Existing adopted SOCKS exits retain their connection and relay settings.
+
+Use View → standalone node → Edit, or `okp edit <management-id-or-node-name>`, to change its name, remote link, local port, local-node setting or separate outbound. Examples:
+
+```bash
+okp edit Home --node-name "Residential"
+okp edit Residential --local-port 7903
+okp edit Residential --no-local-node
+okp edit Residential --via US
+```
+
+`edit --no-local-node` confirms and removes the companion SS node and sing-box listener/outbound/route, preserving the remote node. `add --no-local-node` continues to skip local changes. References from other local outbounds block disabling. Renaming a relay updates its managed dependent nodes' dialer names; unmanaged references block renaming. Existing sing-box tags remain stable; new Shadowsocks outbounds use `ss-{name}-out`.
+
+Standalone nodes receive independent, stable management IDs. Explicit `edit` operations preserve IDs across name, address or password changes. Connection fingerprints ignore remarks and query ordering to recognize repeated imports. Adding a different connection creates a different configuration; use `edit` to replace one. Existing unowned manual nodes require `--adopt-node <node-id>` or confirmation in the wizard; airport-owned nodes cannot be silently converted to standalone nodes.
+
+Standalone records have `airport_id=null`, an empty `airport_name`, and use `remote_node_id`. New records use `kind=node`; adopted records retain `kind=adopted`. `local_source=remote/custom` describes the local outbound, and `remote_fingerprints` stores only digests. Older inventory files are migrated compatibly without changing IDs.
+
+Each change validates links, conflicts and any sing-box candidate before writing a private `node-change-*.json` transaction. After partial success, use `okp --resume` or reopen that node to continue. New parameters, deletion and separate relay operations cannot replace an unfinished transaction. External edits stop recovery. Active journals are cleared on success; `node-backup-*.json` snapshots of modified resources and sing-box backups remain for inspection. Backups contain sensitive parameters and are user-owned `0600` Git-ignored files. Recovery files may temporarily contain links; the inventory does not store full links or passwords.
 
 ### Updates and recovery
 

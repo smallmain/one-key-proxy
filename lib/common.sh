@@ -184,7 +184,7 @@ _okp_xui_count_bare_curl_with() {
     {
       line = $0
       sub(/^[[:space:]]+/, "", line)
-      if (line ~ /^curl[[:space:]]/ && index(line, needle) != 0) count++
+      if (line ~ /^curl[[:space:]]/ && (needle == "" || index(line, needle) != 0)) count++
     }
     END { print count + 0 }
   ' <<<"$document"
@@ -238,7 +238,7 @@ okp_xui_validate_pinned_installer_downloaders() {
   local installer=$1 repository=$2 tag=$3 architecture=$4 size code
   local asset_template asset_output direct_asset_output variable_download
   local raw_prefix raw_total expected_total count
-  local xui_script_url xui_rc_url service_url
+  local xui_script_url xui_rc_url service_url latest_resolver
   local -a service_urls
 
   _okp_xui_validate_release_identity "$repository" "$tag" '' "$architecture" || {
@@ -265,6 +265,30 @@ okp_xui_validate_pinned_installer_downloaders() {
   fi
 
   code=$(awk '!/^[[:space:]]*#/' "$installer") || return 1
+  if [[ $code == *resolve_latest_tag* ]]; then
+    # v3.7.0 scopes release discovery to this helper. Match the audited body
+    # exactly before excluding it from asset checks; pinned installs pass a tag.
+    latest_resolver=$(cat <<'OKP_XUI_LATEST_RESOLVER'
+resolve_latest_tag() {
+    local url tag
+    url=$(curl -sSLI -o /dev/null -w '%{url_effective}' --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://github.com/MHSanaei/3x-ui/releases/latest" 2>/dev/null)
+    tag=${url##*/tag/}
+    if [[ "$tag" != "$url" && -n "$tag" && "$tag" != "latest" ]]; then
+        echo "$tag"
+        return 0
+    fi
+    curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+}
+OKP_XUI_LATEST_RESOLVER
+    ) || return 1
+    [[ $code == *"$latest_resolver"* &&
+      $(_okp_xui_count_literal "$code" 'resolve_latest_tag') == 2 &&
+      $(_okp_xui_count_literal "$code" 'tag_version=$(resolve_latest_tag)') == 1 ]] || {
+      log_error "固定的 3x-ui ${tag} 安装器最新版本查询方式已改变。"
+      return 1
+    }
+    code=${code/"$latest_resolver"/}
+  fi
   [[ $(_okp_xui_count_bare_curl_with "$code" '') == 7 &&
     $(_okp_xui_count_bare_curl_with "$code" 'curl -s https://get.acme.sh | sh') == 2 ]] || {
     log_error '固定的 3x-ui 安装器裸 curl 命令集合已改变。'

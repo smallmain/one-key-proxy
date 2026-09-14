@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Standalone VLESS, Shadowsocks and SOCKS5 node management from links or private files, with explicit adoption, duplicate detection, separate local outbounds and configuration-specific editing.
+- Recoverable remote/local node changes with private journals and backups, stable IDs, relay rename propagation, and independent local-node removal.
 - Local Python/OpenSSH deployment with a Git-ignored `.env`, allowlisted installation defaults, built-in SublinkPro airport defaults and independent airport/node names.
 - Companion Surge local Shadowsocks nodes with independent random passwords, matching sing-box listeners, user-supplied ports and repeatable updates that retain credentials and tags.
 - Configuration management menu for install, add via SSH or subscription URL, delete, view and environment checks; relay settings live inside each configuration's details.
@@ -34,6 +36,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - 3x-ui release assets require and verify the official SHA-256 digest; upstream installer curl requests for `main` files are pinned to the same release commit.
 - Initial installation and maintenance updates check the adapted PATH-curl asset/helper download shape for compatibility drift; the pinned official installer commit remains an explicit root trust boundary.
+
+### Fixed
+
+- Ask for separate airport/node names before interactive SSH deployment or subscription fetching, checkpoint each answer, and preserve explicit names when resuming an already configured VPS.
+- Send the required admin scope when revoking bootstrap, rotated or orphaned API tokens on 3x-ui v3.7.0.
+- Count unfiltered curl commands explicitly on Alpine/BusyBox awk, whose empty-string `index` result differs from other awk implementations.
+- Accept the audited latest-tag resolver introduced in 3x-ui v3.7.0 without counting its scoped curl calls or local URL assignment as release-asset downloads; retain digest, URL, output-path and downloader-bypass checks.
 
 ## [0.1.0] - 2026-08-20
 

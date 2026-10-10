@@ -167,7 +167,8 @@ maintenance_cleanup_temp_paths() {
 
 maintenance_operation_unlock() {
     if [[ -n ${OKP_OPERATION_LOCK_FD-} ]]; then
-        flock -u "$OKP_OPERATION_LOCK_FD" 2>/dev/null || true
+        # An updater child may still share this descriptor while restoring a backup.
+        # Closing our copy keeps the lock held until that child also exits.
         exec {OKP_OPERATION_LOCK_FD}>&-
         OKP_OPERATION_LOCK_FD=''
     fi
@@ -1636,7 +1637,7 @@ maintenance_update_menu() {
     while true; do
         maintenance_heading '手动更新'
         printf '1. 更新 one-key-proxy 项目\n'
-        printf '2. 更新 3x-ui 到最新稳定版\n'
+        printf '2. 更新 3x-ui 到当前 major 的最新稳定版\n'
         printf '0. 返回\n'
         maintenance_read choice '请选择' || return 1
         case "$choice" in
@@ -1739,6 +1740,11 @@ maintenance_uninstall() {
     printf '%s\n' '用空格或逗号分隔；直接回车默认完整卸载。'
     maintenance_read selection '要卸载的组件' 'all' || return 1
     _maintenance_parse_components "$selection" || return 1
+    for component in "${OKP_UNINSTALL_COMPONENTS[@]}"; do
+        if [[ $component != fail2ban ]] && declare -F _okp_i_require_no_remote_relays >/dev/null 2>&1; then
+            _okp_i_require_no_remote_relays || return 1
+        fi
+    done
 
     printf '将卸载:\n'
     for component in "${OKP_UNINSTALL_COMPONENTS[@]}"; do
@@ -1822,6 +1828,7 @@ maintenance_usage() {
   one-key-proxy remove-client           删除迁移完成的旧客户端
   one-key-proxy rotate [类型]            类型: panel/token/client/remove-client
   one-key-proxy uninstall               逐项卸载（默认全选）
+  one-key-proxy remote-relay            本机 TUI 使用的远程中转 JSON 接口
 
 兼容别名: update-project, update-xui, renew
 EOF
@@ -1855,7 +1862,7 @@ maintenance_validate_arguments() {
         '' | info | status | doctor | backup | restore | update-3xui | update-xui | \
             self-update | update-project | update-address | reconfigure-ports | \
             reconfigure-domain | reconfigure | renew-cert | renew | rotate-panel | \
-            rotate-token | rotate-client | remove-client | rotate | uninstall | \
+            rotate-token | rotate-client | remove-client | rotate | uninstall | remote-relay | \
             help | -h | --help) return 0 ;;
         *)
             maintenance_usage >&2
@@ -1874,6 +1881,9 @@ maintenance_dispatch() {
         status) maintenance_diagnostics ;;
         doctor) maintenance_doctor ;;
         backup) maintenance_backup_create ;;
+        remote-relay)
+            maintenance_require_hook okp_hook_remote_relay '远程中转' && okp_hook_remote_relay
+            ;;
         restore) maintenance_require_tty && maintenance_restore ;;
         update-3xui | update-xui) maintenance_require_tty && maintenance_update_xui ;;
         self-update | update-project) maintenance_require_tty && maintenance_update_project ;;

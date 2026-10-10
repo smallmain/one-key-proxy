@@ -11,7 +11,22 @@ AIRPORT_DEFAULTS = {
     "nodeNameIntraUniquify": False, "autoFillCountry": False, "backfillExistingCountry": False,
 }
 LOCAL_SS_METHOD = "aes-128-gcm"
+LOCAL_SS_PORT_START = 7896
 LOCAL_SS_GROUP = "SM"
 LOCAL_SS_TAGS = "稳定"
+RESIDENTIAL_TAG = "家宽"
+
+
+def residential_tags(tags, residential):
+    if residential is None:
+        return list(dict.fromkeys(tags))
+    values = set(tags)
+    if residential is True:
+        values.add(RESIDENTIAL_TAG)
+    elif residential is False:
+        values.discard(RESIDENTIAL_TAG)
+    return sorted(values)
+
+
 SINGBOX_INBOUND = {"type": "shadowsocks", "listen": "127.0.0.1"}
 SINGBOX_OUTBOUND = {"type": "vless"}

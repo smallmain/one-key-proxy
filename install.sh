@@ -939,6 +939,41 @@ redact_xui_bootstrap_token_file() {
   mv -f -- "$temporary" "$file"
 }
 
+install_compatible_xray() {
+  local directory metadata target source architecture binary incoming detected status=0
+  directory=$(mktemp -d) || return 1
+  install_temp_register "$directory"
+  log_info '正在选择并下载兼容的官方 Xray。'
+  metadata=$(python3 -I "${SCRIPT_DIR}/lib/panel_maintenance.py" --prepare-core "$directory") || return 1
+  target=$(jq -er '.version | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<<"$metadata") || return 1
+  source=$(jq -er '.binary' <<<"$metadata") || return 1
+  [[ $source == "$directory/xray" && -f $source && ! -L $source ]] || return 1
+  architecture=$PLATFORM_ARCH
+  case $architecture in armv6|armv7) architecture=arm32 ;; esac
+  binary="/usr/local/x-ui/bin/xray-linux-${architecture}"
+  [[ -f $binary && ! -L $binary ]] || return 1
+  detected=$("$binary" version 2>/dev/null) || return 1
+  if [[ $detected == "Xray ${target#v}" || $detected == "Xray ${target#v} "* ]]; then
+    log_info "Xray 已是兼容版本 ${target}。"
+    return 0
+  fi
+  cp -p -- "$binary" "$directory/original-core" || return 1
+  incoming=$(mktemp /usr/local/x-ui/bin/.okp-core.XXXXXX) || return 1
+  if install -m 0755 -- "$source" "$incoming" && platform_service_stop x-ui &&
+      mv -f -- "$incoming" "$binary" && platform_service_start x-ui &&
+      platform_service_is_active x-ui; then
+    log_info "Xray 已配置为兼容版本 ${target}。"
+  else
+    status=1
+    platform_service_stop x-ui || true
+    install -m 0755 -- "$directory/original-core" "$incoming" && mv -f -- "$incoming" "$binary" || return 1
+    platform_service_start x-ui || true
+    log_error '兼容 Xray 配置失败，已还原安装器提供的内核；请继续安装流程重试。'
+  fi
+  rm -f -- "$incoming"
+  return "$status"
+}
+
 stage_xui_install() {
   local tag commit asset_sha256 installer output_file status supply_dir pinned_path
   prepare_xui_install_transaction || return 1
@@ -947,6 +982,7 @@ stage_xui_install() {
       log_warn '检测到本项目上次启动但尚未标记完成的 3x-ui，正在核验并续接。'
       XUI_INSTALL_GUARD_ACTIVE=true
       secure_xui_install_result || return 1
+      install_compatible_xray || return 1
       bind_new_xui_panel_to_loopback || return 1
       ensure_xui_service_autostart || return 1
       capture_xui_api_token || return 1
@@ -1015,6 +1051,7 @@ stage_xui_install() {
     log_error 'x-ui 服务未运行。'
     return 1
   }
+  install_compatible_xray || return 1
   capture_xui_api_token || return 1
   write_xui_install_result || return 1
   secure_xui_install_result || return 1

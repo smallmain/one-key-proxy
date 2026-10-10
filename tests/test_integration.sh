@@ -1095,6 +1095,20 @@ test_database_delete_failure_preserves_install_result_and_state() {
   assert_eq "$xui_dir/x-ui.db" "${TEST_STATE[XUI_DB_PATH]}"
 }
 
+test_remote_relay_guard_protects_pending_records_and_uninstall() {
+  CONFIG_DIR=$TEST_SANDBOX/relay-guard-state
+  mkdir -p "$CONFIG_DIR/remote-relays"
+  assert_success _okp_i_require_no_remote_relays
+  printf '{}\n' >"$CONFIG_DIR/remote-relays/pending.json"
+  log_error() { printf '%s\n' "$*" >&2; }
+  assert_failure _okp_i_require_no_remote_relays
+  _okp_i_uninstall_clients() { printf touched >"$CONFIG_DIR/touched"; }
+  assert_failure okp_hook_uninstall_component clients
+  [[ ! -e $CONFIG_DIR/touched ]] || return 1
+  rm -- "$CONFIG_DIR/remote-relays/pending.json"
+  assert_success _okp_i_require_no_remote_relays
+}
+
 run_test 'NAT port-only changes reuse a matching IP certificate' test_nat_unchanged_san_does_not_replace_certificate
 run_test 'NAT certificate replacement activates and commits its journal' test_nat_replacement_activates_then_commits_transition
 run_test 'preparing TLS transition recovery is bound to certificate SAN' test_preparing_transition_recovery_is_san_bound
@@ -1141,5 +1155,7 @@ run_test 'combined uninstall rejects an unsafe install result path' \
   test_combined_uninstall_rejects_unsafe_install_result
 run_test 'database deletion failure preserves the install result and state' \
   test_database_delete_failure_preserves_install_result_and_state
+run_test 'remote relay guard protects pending transactions and client uninstall' \
+  test_remote_relay_guard_protects_pending_records_and_uninstall
 
 finish_tests

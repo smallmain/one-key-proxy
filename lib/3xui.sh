@@ -384,7 +384,7 @@ xui_load_api_context() {
 }
 
 _xui_api_request() (
-    local method=$1 path=$2 body=${3-} token_override=${4-}
+    local method=$1 path=$2 body=${3-} token_override=${4-} encoding=${5:-json}
     local temp_dir config_file response_file body_file http_code response msg request_url
     local -a curl_args
 
@@ -447,12 +447,22 @@ _xui_api_request() (
         fi
     fi
     if [[ $method == POST ]]; then
-        jq -e . > /dev/null 2>&1 <<< "$body" || {
-            _xui_error 'Refusing to send invalid JSON to 3x-ui'
-            exit 1
-        }
+        case $encoding in
+            json)
+                jq -e . > /dev/null 2>&1 <<< "$body" || {
+                    _xui_error 'Refusing to send invalid JSON to 3x-ui'
+                    exit 1
+                }
+                curl_args+=(--header 'Content-Type: application/json')
+                ;;
+            form)
+                [[ $body != *[[:cntrl:]]* ]] || exit 1
+                curl_args+=(--header 'Content-Type: application/x-www-form-urlencoded')
+                ;;
+            *) _xui_error 'Unsupported 3x-ui request encoding'; exit 1 ;;
+        esac
         printf '%s' "$body" > "$body_file"
-        curl_args+=(--header 'Content-Type: application/json' --data-binary "@$body_file")
+        curl_args+=(--data-binary "@$body_file")
     fi
 
     if ! http_code=$(curl "${curl_args[@]}"); then

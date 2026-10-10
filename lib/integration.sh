@@ -26,6 +26,7 @@ OKP_PROJECT_TARGET_VERSION=''
 OKP_XUI_TARGET_TAG=''
 OKP_XUI_TARGET_COMMIT=''
 OKP_XUI_TARGET_ASSET_SHA256=''
+OKP_XRAY_TARGET_TAG=''
 OKP_XUI_UPDATE_CHILD_PID=''
 OKP_XUI_UPDATE_PENDING_SIGNAL=''
 OKP_XUI_UPDATE_SUPERVISION_ARMED=false
@@ -816,6 +817,9 @@ okp_hook_settle_pending_xui_update() {
     fi
 
     _okp_i_disarm_xui_update_supervision
+    if [[ ${OKP_PANEL_UPDATE_RUNNING:-false} != true && -e /etc/one-key-proxy-panel/pending.json ]]; then
+        _okp_i_panel_maintenance '{"operation":"panel-recover"}' >/dev/null || return 1
+    fi
     if [[ -n $OKP_XUI_UPDATE_PENDING_SIGNAL ]]; then
         signal_status=$(_okp_i_xui_update_signal_status \
             "$OKP_XUI_UPDATE_PENDING_SIGNAL") || signal_status=1
@@ -888,6 +892,51 @@ _okp_i_load_config() {
     okp_hook_settle_pending_xui_update || return 1
     _okp_i_recover_tls_transition || return 1
     _okp_i_load_saved_config
+}
+
+_okp_i_require_no_remote_relays() {
+    local directory=${CONFIG_DIR}/remote-relays first
+    [[ ! -e $directory && ! -L $directory ]] && return 0
+    [[ -d $directory && ! -L $directory ]] || return 1
+    first=$(find "$directory" -mindepth 1 -maxdepth 1 -name '*.json' -print -quit) || return 1
+    if [[ -n $first ]]; then
+        log_error '此服务器仍有受管远程中转（含未完成操作）；请先在本机 TUI 删除中转，再重配置或卸载。'
+        return 1
+    fi
+}
+
+okp_hook_remote_relay() {
+    local helper owner mode key live_version
+    _okp_i_load_config >&2 || return 1
+    [[ $(state_get MANAGED_BY) == one-key-proxy ]] && stage_is_done completed || return 1
+    _okp_i_find_owned_inbound >&2 || return 1
+    helper=$RUNTIME_DIR/lib/remote_relay.py
+    [[ -f $helper && ! -L $helper ]] || {
+        log_error '远程中转运行文件缺失；请先更新服务器上的本项目。'
+        return 1
+    }
+    owner=$(stat -c '%u' -- "$helper") || return 1
+    mode=$(stat -c '%a' -- "$helper") || return 1
+    [[ $owner == 0 ]] && (( (8#$mode & 022) == 0 )) || return 1
+    live_version=$("$OKP_XUI_BINARY_PATH" -v 2>/dev/null) || return 1
+    [[ $live_version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    export OKP_REMOTE_RELAY_CONTEXT
+    OKP_REMOTE_RELAY_CONTEXT=$(
+        for key in INSTALLATION_ID XUI_VERSION INBOUND_ID INBOUND_TAG VLESS_URI NODE_INTERNAL_PORT; do
+            if [[ $key == XUI_VERSION ]]; then
+                printf '%s=%s\n' "$key" "$(_state_encode "$live_version")" || exit 1
+            else
+                printf '%s=%s\n' "$key" "$(_state_encode "$(state_get "$key")")" || exit 1
+            fi
+        done | python3 -c '
+import base64, json, sys
+values = dict(line.rstrip("\n").split("=", 1) for line in sys.stdin)
+values = {key: base64.b64decode(value, validate=True).decode() for key, value in values.items()}
+print(json.dumps({"installation_id": values["INSTALLATION_ID"].lower(), "version": values["XUI_VERSION"],
+                 "inbound_id": int(values["INBOUND_ID"]), "inbound_tag": values["INBOUND_TAG"],
+                 "vless_uri": values["VLESS_URI"], "inbound_port": int(values["NODE_INTERNAL_PORT"])}))'
+    ) || return 1
+    python3 -I "$helper"
 }
 
 _okp_i_public_host() {
@@ -1748,6 +1797,7 @@ okp_hook_reconfigure() {
     local old_sub_external old_sub_internal old_firewall
 
     _okp_i_load_config || return 1
+    _okp_i_require_no_remote_relays || return 1
     _okp_i_resume_pending_acme_cleanup true || return 1
     old_public_ipv4=$PUBLIC_IPV4
     old_public_ipv6=$PUBLIC_IPV6
@@ -2044,11 +2094,16 @@ okp_hook_project_update() {
 }
 
 _okp_i_fetch_xui_target() {
-    local response commit_document
+    local response commit_document current policy core_document
     _okp_i_validate_github_source "$OKP_XUI_REPO" || return 1
-    response=$(curl --disable --noproxy '*' -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
-        --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        "https://api.github.com/repos/${OKP_XUI_REPO}/releases/latest") || return 1
+    current=$("$OKP_XUI_BINARY_PATH" -v 2>/dev/null) || return 1
+    [[ $current =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        log_error '无法识别当前 3x-ui 版本，拒绝选择更新目标。'
+        return 1
+    }
+    policy="${OKP_MAINTENANCE_DIR}/lib/panel_version.py"
+    [[ -f $policy && ! -L $policy && $OKP_XUI_REPO == MHSanaei/3x-ui ]] || return 1
+    response=$(python3 -I "$policy" "$current") || return 1
     OKP_XUI_TARGET_TAG=$(jq -er '
         select(.draft == false and .prerelease == false) | .tag_name |
         select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
@@ -2062,6 +2117,8 @@ _okp_i_fetch_xui_target() {
     okp_xui_release_asset_from_json "$OKP_XUI_REPO" "$OKP_XUI_TARGET_TAG" \
         "$PLATFORM_ARCH" "$response" || return 1
     OKP_XUI_TARGET_ASSET_SHA256=$OKP_XUI_RELEASE_ASSET_SHA256
+    core_document=$(python3 -I "$policy" --xray) || return 1
+    OKP_XRAY_TARGET_TAG=$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<<"$core_document") || return 1
 }
 
 _okp_i_check_xui_release_api() {
@@ -2112,14 +2169,15 @@ _okp_i_check_xui_release_api() {
 
 okp_hook_xui_update_info() {
     local current
-    current=$(_okp_i_state XUI_VERSION unknown)
+    current=$("$OKP_XUI_BINARY_PATH" -v 2>/dev/null) || return 1
     _okp_i_fetch_xui_target || {
-        log_error '无法查询 3x-ui 最新稳定版。'
+        log_error '无法确定当前策略允许的 3x-ui 更新目标。'
         return 1
     }
     _okp_i_check_xui_release_api "$OKP_XUI_TARGET_COMMIT" || return 1
     printf '当前 3x-ui 版本: %s\n' "$current"
     printf '目标 3x-ui 版本: %s\n' "$OKP_XUI_TARGET_TAG"
+    printf '目标 Xray 兼容版本: %s\n' "$OKP_XRAY_TARGET_TAG"
     printf '目标 commit: %s\n' "$OKP_XUI_TARGET_COMMIT"
     printf '目标资产 SHA-256: %s\n' "$OKP_XUI_TARGET_ASSET_SHA256"
     printf '来源: https://github.com/%s/tree/%s\n' "$OKP_XUI_REPO" "$OKP_XUI_TARGET_COMMIT"
@@ -2140,99 +2198,31 @@ _okp_i_reassert_xui_configuration() {
     _okp_i_verify_subscription_delivery "$public_host"
 }
 
+_okp_i_panel_maintenance() {
+    local request=$1 helper policy output
+    helper="${OKP_MAINTENANCE_DIR}/lib/panel_maintenance.py"
+    policy="${OKP_MAINTENANCE_DIR}/lib/panel_version.py"
+    _maintenance_library_is_secure "$helper" file && _maintenance_library_is_secure "$policy" file || return 1
+    output=$(OKP_OPERATION_LOCK_FD="${OKP_OPERATION_LOCK_FD:-}" python3 -I "$helper" <<<"$request") || return 1
+    if ! jq -e '.ok == true and (.result | type == "object")' <<<"$output" >/dev/null; then
+        log_error "$(jq -r '.error // "面板维护未返回有效结果。"' <<<"$output")"
+        return 1
+    fi
+    printf '%s\n' "$output"
+}
+
 okp_hook_xui_update() {
-    local installer output status current current_commit current_asset failure_output
-    local supply_dir pinned_path
-    # maintenance_main settles before the informational and backup phases. Keep
-    # this defensive check so direct hook callers can never replay the upstream
-    # updater over an unresolved journal.
+    local current request
     okp_hook_settle_pending_xui_update || return 1
-    _okp_i_register_state_secrets
-    if [[ ! $OKP_XUI_TARGET_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ||
-        ! $OKP_XUI_TARGET_COMMIT =~ ^[0-9a-f]{40}$ ||
-        ! $OKP_XUI_TARGET_ASSET_SHA256 =~ ^[0-9a-f]{64}$ ]]; then
+    if [[ ! $OKP_XUI_TARGET_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || -z ${OKP_XRAY_TARGET_TAG:-} ]]; then
         _okp_i_fetch_xui_target || return 1
     fi
-    current=$(_okp_i_state XUI_VERSION)
-    current_commit=$(_okp_i_state XUI_RELEASE_COMMIT)
-    current_asset=$(_okp_i_state XUI_RELEASE_ASSET_SHA256)
-    if [[ $current == "$OKP_XUI_TARGET_TAG" && $current_commit == "$OKP_XUI_TARGET_COMMIT" &&
-        $current_asset == "$OKP_XUI_TARGET_ASSET_SHA256" ]]; then
-        log_info '3x-ui 已是最新稳定版；仍将执行健康检查。'
-        okp_hook_diagnostics
-        return $?
-    fi
-    _okp_i_check_xui_release_api "$OKP_XUI_TARGET_COMMIT" || return 1
-    installer=$(mktemp "/tmp/one-key-proxy-xui-install.XXXXXX") || return 1
-    output=$(mktemp "/tmp/one-key-proxy-xui-output.XXXXXX") || {
-        rm -f -- "$installer"
-        return 1
-    }
-    chmod 0600 "$installer" "$output"
-    maintenance_temp_register "$installer" || {
-        rm -f -- "$installer" "$output"
-        return 1
-    }
-    maintenance_temp_register "$output" || {
-        rm -f -- "$installer" "$output"
-        return 1
-    }
-    supply_dir=$(mktemp -d "/tmp/one-key-proxy-xui-supply.XXXXXX") || {
-        rm -f -- "$installer" "$output"
-        return 1
-    }
-    maintenance_temp_register "$supply_dir" || {
-        rm -rf -- "$supply_dir"
-        rm -f -- "$installer" "$output"
-        return 1
-    }
-    _okp_i_download \
-        "https://raw.githubusercontent.com/${OKP_XUI_REPO}/${OKP_XUI_TARGET_COMMIT}/install.sh" \
-        "$installer" || {
-        rm -f -- "$installer" "$output"
-        return 1
-    }
-    platform_detect || return 1
-    okp_xui_validate_pinned_installer_downloaders "$installer" "$OKP_XUI_REPO" \
-        "$OKP_XUI_TARGET_TAG" "$PLATFORM_ARCH" || return 1
-    okp_prepare_pinned_xui_download "$OKP_XUI_REPO" "$OKP_XUI_TARGET_TAG" \
-        "$OKP_XUI_TARGET_COMMIT" "$PLATFORM_ARCH" "$OKP_XUI_TARGET_ASSET_SHA256" \
-        "$supply_dir" || return 1
-    # Upstream's post-install hardening rewrites a root webBasePath. Persist a
-    # recovery marker before it can mutate the database so an interrupted
-    # maintenance run repairs the path before its next API request.
-    state_set XUI_UPDATE_RECOVERY_STATUS restore-root-path || return 1
-    pinned_path="${OKP_XUI_PINNED_BIN_DIR}:${PATH}"
-    if _okp_i_run_supervised_xui_updater "$installer" "$OKP_XUI_TARGET_TAG" \
-        "$pinned_path" "$output"; then
-        status=0
-    else
-        status=$?
-    fi
-    rm -f -- "$installer"
-    rm -rf -- "$supply_dir"
-    if ((status != 0)); then
-        log_error "3x-ui 官方更新器失败（退出码 ${status}）。"
-        failure_output=$(redact_sensitive "$(tail -n 50 "$output")")
-        failure_output=$(_xui_sanitize_log_message "$failure_output")
-        [[ -z $failure_output ]] || log_error "$failure_output"
-        rm -f -- "$output"
-        if ! okp_hook_settle_pending_xui_update; then
-            log_error '3x-ui 更新失败后的根路径恢复也未完成；服务已按失败关闭策略处理。'
-        fi
-        return "$status"
-    fi
-    rm -f -- "$output"
-    # This stops x-ui, restores '/', verifies the CLI readback, starts x-ui,
-    # and only then performs the first root-path API health call.
-    okp_hook_settle_pending_xui_update || return 1
-    _okp_i_reassert_xui_configuration || return 1
-    state_set_many XUI_VERSION "$OKP_XUI_TARGET_TAG" \
-        XUI_RELEASE_COMMIT "$OKP_XUI_TARGET_COMMIT" \
-        XUI_RELEASE_ASSET_SHA256 "$OKP_XUI_TARGET_ASSET_SHA256" || return 1
-    _okp_i_write_result || return 1
-    okp_hook_diagnostics || return 1
-    log_info "3x-ui 已更新到 ${OKP_XUI_TARGET_TAG}。"
+    current=$("$OKP_XUI_BINARY_PATH" -v 2>/dev/null) || return 1
+    current="v${current#v}"
+    request=$(jq -cn --arg current "$current" --arg target "$OKP_XUI_TARGET_TAG" --arg core "$OKP_XRAY_TARGET_TAG" \
+        '{operation:"panel-update",current:$current,target:$target,core_target:$core}') || return 1
+    _okp_i_panel_maintenance "$request" >/dev/null || return 1
+    log_info "3x-ui：${OKP_XUI_TARGET_TAG}；Xray：${OKP_XRAY_TARGET_TAG}。"
 }
 
 okp_hook_rotate_panel_credentials() {
@@ -2374,7 +2364,7 @@ okp_hook_delete_old_client() {
     inbound_clients=$(jq -c '.settings.clients // []' <<<"$XUI_MANAGED_INBOUND_JSON") || return 1
     last_online=$(xui_api_post /panel/api/clients/lastOnline '{}' 2>/dev/null || printf '{}')
     while IFS= read -r item; do
-        [[ -n $item && $item != "$current" ]] || continue
+        [[ -n $item && $item != "$current" && $item != okp-relay-* ]] || continue
         _okp_i_csv_has "$managed" "$item" || continue
         _okp_i_url_encode "$item" >/dev/null || {
             log_error '受管客户端清单包含不安全标识，拒绝继续。'
@@ -2723,6 +2713,7 @@ _okp_i_uninstall_project_state() {
 
 okp_hook_uninstall_component() {
     local component=${1-}
+    [[ $component == fail2ban ]] || _okp_i_require_no_remote_relays || return 1
     case "$component" in
         inbound) _okp_i_uninstall_inbound ;;
         clients) _okp_i_uninstall_clients ;;

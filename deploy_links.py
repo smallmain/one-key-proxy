@@ -45,6 +45,64 @@ class NodeLink:
     def marked(self, identity):
         return urllib.parse.urlsplit(self.link)._replace(fragment="okp-remote:" + identity).geturl()
 
+    def reality_spider(self):
+        if "spx" not in self.query:
+            return None
+        if self.query.get("security") != "reality":
+            raise DeployError("spx 参数仅适用于 REALITY 节点。")
+        spider = self.query["spx"] or "/"
+        if not spider.startswith("/"):
+            raise DeployError("REALITY 的 spx 参数必须是以 / 开头的路径。")
+        return spider
+
+    def xray_outbound(self):
+        spider = self.reality_spider() if self.protocol == "vless" else None
+        try:
+            native = self.outbound()
+        except DeployError as error:
+            raise DeployError("Xray 落地转换失败：" + str(error)) from None
+        server = {"address": self.host, "port": self.port}
+        if self.protocol == "socks5":
+            if self.auth:
+                server["users"] = [{"user": self.auth["username"], "pass": self.auth["password"]}]
+            return {"protocol": "socks", "settings": {"servers": [server]}}
+        if self.protocol == "ss":
+            if self.auth["method"] not in ("aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+                                            "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+                                            "2022-blake3-chacha20-poly1305"):
+                raise DeployError("Xray 不支持此 Shadowsocks 加密方式。")
+            server.update(self.auth)
+            return {"protocol": "shadowsocks", "settings": {"servers": [server]}}
+        q = self.query
+        security = q.get("security", "none")
+        if security == "none":
+            raise DeployError("远程中转的 VLESS 落地必须启用 TLS 或 REALITY。")
+        user = {"id": self.auth["uuid"], "encryption": "none"}
+        if q.get("flow"):
+            user["flow"] = q["flow"]
+        server["users"] = [user]
+        stream = {"network": q.get("type", "tcp"), "security": security}
+        tls = native["tls"]
+        settings = {"serverName": tls["server_name"]}
+        if tls.get("alpn"):
+            settings["alpn"] = tls["alpn"]
+        if tls.get("utls"):
+            settings["fingerprint"] = tls["utls"]["fingerprint"]
+        if security == "reality":
+            settings.update(publicKey=q["pbk"], shortId=q.get("sid", ""))
+            if spider is not None:
+                settings["spiderX"] = spider
+        elif "insecure" in tls:
+            settings["allowInsecure"] = tls["insecure"]
+        stream[security + "Settings"] = settings
+        if stream["network"] == "ws":
+            stream["wsSettings"] = {"path": q.get("path", "/")}
+            if q.get("host"):
+                stream["wsSettings"]["headers"] = {"Host": q["host"]}
+        elif stream["network"] == "grpc":
+            stream["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
+        return {"protocol": "vless", "settings": {"vnext": [server]}, "streamSettings": stream}
+
     def outbound(self):
         result = {"type": {"ss": "shadowsocks", "socks5": "socks"}.get(self.protocol, self.protocol),
                   "server": self.host, "server_port": self.port}
@@ -58,9 +116,11 @@ class NodeLink:
             return dict(result, **self.auth)
         q = self.query
         allowed = {"type", "security", "encryption", "flow", "sni", "fp", "pbk", "sid", "alpn",
-                   "allowInsecure", "path", "host", "serviceName"}
+                   "allowInsecure", "path", "host", "serviceName", "spx"}
         if set(q) - allowed:
             raise DeployError("VLESS 链接包含本地转换尚不支持的参数，请使用受支持的本地出站链接。")
+        # sing-box has no Xray crawler setting; retain the REALITY authentication fields.
+        self.reality_spider()
         transport, security, flow = q.get("type", "tcp"), q.get("security", "none"), q.get("flow", "")
         if (transport not in ("tcp", "ws", "grpc") or security not in ("none", "tls", "reality")
                 or q.get("encryption", "none") != "none" or flow not in ("", "xtls-rprx-vision")

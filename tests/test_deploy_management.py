@@ -32,7 +32,7 @@ class MenuTests(unittest.TestCase):
         with patch("builtins.input", return_value="0"), contextlib.redirect_stdout(output):
             deploy.choose_action({"phase": "input"})
         self.assertEqual(output.getvalue().strip().splitlines()[1:], [
-            "  1. 安装配置", "  2. 添加配置", "  3. 删除配置", "  4. 查看配置", "  5. 检查环境", "  0. 退出"])
+            "  1. 安装配置", "  2. 添加配置", "  3. 删除配置", "  4. 查看配置", "  5. 更新面板", "  6. 检查环境", "  0. 退出"])
 
     def test_check_returns_to_menu_without_touching_pending(self):
         state = deploy.ResumeState()
@@ -41,7 +41,7 @@ class MenuTests(unittest.TestCase):
             state.capture(target="root@old")
         before = state.path.read_bytes()
         output = io.StringIO()
-        with patch("builtins.input", side_effect=["5", "0"]), patch.object(deploy, "run_workflow") as run, \
+        with patch("builtins.input", side_effect=["6", "0"]), patch.object(deploy, "run_workflow") as run, \
                 contextlib.redirect_stdout(output):
             deploy.main([])
         self.assertEqual(run.call_args.args[0].action, "check")
@@ -70,6 +70,63 @@ class MenuTests(unittest.TestCase):
                     self.assertFalse(state.path.exists())
                 self.assertGreater(output.getvalue().index("继续上次"), output.getvalue().index("0. 退出"))
 
+    def test_interactive_continue_uses_saved_workflow_without_new_overrides(self):
+        state = deploy.ResumeState()
+        with state.locked():
+            state.start("install", self.root / ".env")
+            state.capture(target="root@old", name="Saved", local_port=7900)
+        with patch("builtins.input", return_value="1"), patch.object(deploy, "run_workflow") as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            deploy.main(["install", "root@new", "--interactive", "--name", "New", "--local-port", "7909"])
+        args = run.call_args.args[0]
+        self.assertEqual((args.target, args.name, args.local_port), ("root@old", "Saved", 7900))
+        self.assertNotIn("name", args.supplied_fields)
+        self.assertTrue(args.resume)
+
+    def test_interactive_failure_points_to_menu_without_cli_parameters(self):
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=["1", "0"]), \
+                patch.object(deploy, "run_workflow", side_effect=deploy.DeployError("Failure")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(output):
+            deploy.main([])
+        self.assertIn("安装配置", output.getvalue())
+        self.assertIn("继续上次", output.getvalue())
+        self.assertNotIn("--resume", output.getvalue())
+        self.assertNotIn("--fresh", output.getvalue())
+        self.assertTrue(deploy.ResumeState().path.exists())
+
+    def test_interactive_conflict_points_to_menu_without_cli_parameters(self):
+        state = deploy.ResumeState()
+        with state.locked():
+            state.start("install", self.root / ".env")
+            state.capture(target="root@old")
+        before = state.path.read_bytes()
+        with self.assertRaises(deploy.DeployError) as error:
+            deploy.main(["install", "root@new"])
+        self.assertIn("主菜单", str(error.exception))
+        self.assertNotIn("--resume", str(error.exception))
+        self.assertNotIn("--fresh", str(error.exception))
+        self.assertEqual(state.path.read_bytes(), before)
+
+    def test_noninteractive_failure_retains_cli_resume_hint(self):
+        output = io.StringIO()
+        with patch.object(deploy.sys.stdin, "isatty", return_value=False), \
+                patch.object(deploy, "run_workflow", side_effect=deploy.DeployError("Failure")), \
+                contextlib.redirect_stderr(output), self.assertRaises(deploy.DeployError):
+            deploy.main(["add", "root@host"])
+        self.assertIn("python3 deploy.py --resume", output.getvalue())
+
+    def test_started_node_transaction_only_offers_continue_or_return(self):
+        output = io.StringIO()
+        pending = {"phase": "sync", "options": {"action": "edit", "source": "node"}}
+        with patch("builtins.input", side_effect=["2", "0"]), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(deploy.choose_pending(pending), "0")
+        self.assertIn("1. 继续上次", output.getvalue())
+        self.assertIn("0. 返回", output.getvalue())
+        self.assertNotIn("重新开始", output.getvalue())
+        self.assertNotIn("--resume", output.getvalue())
+
     def test_configuration_detail_owns_relay_action(self):
         state = deploy.ResumeState()
         identity = "a" * 32
@@ -82,6 +139,21 @@ class MenuTests(unittest.TestCase):
             deploy.main([])
         self.assertEqual(relay.call_args.args[0].target, identity)
         self.assertIsNone(relay.call_args.args[0].relay)
+
+    def test_pending_cancel_is_displayed_as_incomplete_in_list_and_detail(self):
+        state = deploy.ResumeState()
+        with state.locked():
+            registry = deploy.ManagedDeployments(state)
+            registry.register("a" * 32, "root@host", self.root / ".env", fixtures.CONFIG["SUBLINKPRO_URL"], "Node")
+            registry.update("a" * 32, status="relaying", relay_id=None)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            deploy.main(["list"])
+            with patch("builtins.input", side_effect=["4", "1", "0", "0", "0"]):
+                deploy.main([])
+        self.assertIn("relaying（中转变更未完成）", output.getvalue())
+        self.assertIn("是否中转：待取消中转", output.getvalue())
+        self.assertNotIn("否（直连）", output.getvalue())
 
     def test_subscription_wizard_does_not_ask_ssh_questions(self):
         args = argparse.Namespace(action="add", target=None, source=None, subscription_url=None,
@@ -182,7 +254,7 @@ class NamingTests(unittest.TestCase):
 
         with patch.object(deploy, "read_env", return_value=fixtures.CONFIG.copy()), \
                 patch.object(deploy.sys.stdin, "isatty", return_value=True), \
-                patch("builtins.input", side_effect=["Airport", "Custom node"]), \
+                patch("builtins.input", side_effect=["Airport", "Custom node", "n"]), \
                 patch.object(deploy, "SSH") as ssh, patch.object(deploy, "install") as install, \
                 patch.object(deploy, "export_node", return_value=fixtures.NODE), \
                 patch.object(deploy.SublinkPro, "sync", return_value="done") as sync, \
@@ -220,8 +292,12 @@ class SubscriptionWorkflowTests(unittest.TestCase):
     cleanup = fixtures.SublinkTests.cleanup
 
     def fixture_request(self, client, *args, **kwargs):
+        previous_url = client.url
         client.url = self.client.url
-        return self.original_request(client, *args, **kwargs)
+        try:
+            return self.original_request(client, *args, **kwargs)
+        finally:
+            client.url = previous_url
 
     def run_cli(self, arguments, config=None):
         self.original_request = deploy.SublinkPro.request
@@ -240,6 +316,30 @@ class SubscriptionWorkflowTests(unittest.TestCase):
         self.assertEqual(record["status"], "active")
         self.assertEqual(record["kind"], "subscription")
         self.assertNotIn("private-subscription-token", json.dumps(record))
+        self.assertFalse(deploy.ResumeState().path.exists())
+
+    def test_residential_url_add_tags_imported_nodes_and_preserves_other_tags(self):
+        self.server.state["nodes"] = [dict(fixtures.SS_TEMPLATE, ID=501, Name="Remote", Protocol="vless", SourceID=21,
+                                          Link=fixtures.NODE["VLESS_URI"])]
+        self.server.state["tags"][501] = ["稳定", "custom"]
+        self.run_cli(["add", URL, "--no-local-node", "--airport-name", "Home", "--residential"])
+        self.assertEqual(set(self.server.state["tags"][501]), {"稳定", "custom", "家宽"})
+        self.run_cli(["add", URL, "--no-local-node"])
+        self.assertEqual(set(self.server.state["tags"][501]), {"稳定", "custom", "家宽"})
+
+    def test_residential_url_tag_failure_resumes_without_recreating_airport(self):
+        self.server.state["nodes"] = [dict(fixtures.SS_TEMPLATE, ID=501, Name="Remote", Protocol="vless", SourceID=21,
+                                          Link=fixtures.NODE["VLESS_URI"])]
+        self.server.state["tags"][501] = ["稳定"]
+        self.server.state["fail_tags_once"] = True
+        with self.assertRaises(deploy.DeployError), contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli(["add", URL, "--no-local-node", "--airport-name", "Home", "--residential"])
+        self.assertTrue(deploy.ResumeState().load()["options"]["residential"])
+        self.server.state["calls"].clear()
+        self.run_cli(["--resume"])
+        self.assertEqual(len(self.server.state["airports"]), 1)
+        self.assertIn("家宽", self.server.state["tags"][501])
+        self.assertFalse(any(method != "GET" and "/airports" in path for method, path, _, _ in self.server.state["calls"]))
         self.assertFalse(deploy.ResumeState().path.exists())
 
     def test_failed_url_add_preserves_private_input_and_resumes(self):
@@ -275,8 +375,9 @@ class SubscriptionWorkflowTests(unittest.TestCase):
         document = json.loads(path.read_text())
         inbound = document["inbounds"][-1]
         self.assertEqual((inbound["listen_port"], inbound["method"], inbound["password"]), (port, method, password))
-        self.assertEqual(inbound["tag"], "ss-Local-in")
-        self.assertEqual(document["outbounds"][-1]["tag"], "vless-Local-out")
+        record = next(iter(deploy.ManagedDeployments(deploy.ResumeState()).records.items()))
+        self.assertEqual(inbound["tag"], deploy.SingBox.tags(record[0])[0])
+        self.assertEqual(document["outbounds"][-1]["tag"], deploy.SingBox.tags(record[0])[1])
         self.assertEqual(document["route"]["final"], "direct")
         self.assertEqual(document["inbounds"][:-1], original["inbounds"])
         self.assertFalse(deploy.ResumeState().path.exists())

@@ -1,11 +1,13 @@
 import argparse
 import base64
 import contextlib
+import errno
 import copy
 import http.server
 import importlib.util
 import io
 import json
+import socket
 import os
 import re
 from pathlib import Path
@@ -21,6 +23,7 @@ import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from deploy_resources import atomic_write
 SPEC = importlib.util.spec_from_file_location("deploy", ROOT / "deploy.py")
 deploy = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(deploy)
@@ -150,7 +153,7 @@ class InteractiveTests(unittest.TestCase):
         self.assertFalse(args.create_local_node)
 
     def test_wizard_keeps_ssh_config_and_uses_env_default(self):
-        args = self.options(action="sync", target="ssh-alias")
+        args = self.options(action="add", target="ssh-alias")
         with patch("builtins.input", side_effect=["", "3", ""]):
             deploy.configure_interactive(args, dict(CONFIG, ENABLE_LOCAL_NODE="false"))
         self.assertIsNone(args.port)
@@ -158,14 +161,14 @@ class InteractiveTests(unittest.TestCase):
         self.assertFalse(args.create_local_node)
 
     def test_explicit_choice_is_not_prompted_again(self):
-        args = self.options(action="sync", target="ssh-alias", create_local_node=True)
+        args = self.options(action="add", target="ssh-alias", create_local_node=True)
         with patch("builtins.input", side_effect=["", "3"]) as prompt:
             deploy.configure_interactive(args, dict(CONFIG, ENABLE_LOCAL_NODE="false"))
         self.assertEqual(prompt.call_count, 2)
         self.assertTrue(args.create_local_node)
 
     def test_wizard_validates_ports_and_handles_eof(self):
-        args = self.options(action="sync", target="ssh-alias", create_local_node=False)
+        args = self.options(action="add", target="ssh-alias", create_local_node=False)
         with patch("builtins.input", side_effect=["0", "65536", "2200", "3"]), \
                 contextlib.redirect_stderr(io.StringIO()):
             deploy.configure_interactive(args, CONFIG)
@@ -180,7 +183,7 @@ class InteractiveTests(unittest.TestCase):
             deploy.local_node_default({"ENABLE_LOCAL_NODE": "typo"})
 
     def test_wizard_defaults_to_password_authentication(self):
-        args = self.options(action="sync", target="root@host", create_local_node=False)
+        args = self.options(action="add", target="root@host", create_local_node=False)
         with patch("builtins.input", side_effect=["", ""]) as prompt:
             deploy.configure_interactive(args, CONFIG)
         self.assertTrue(args.password)
@@ -188,12 +191,12 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(prompt.call_count, 2)
 
     def test_wizard_supports_private_key_and_explicit_password_flag(self):
-        args = self.options(action="sync", target="root@host", create_local_node=False)
+        args = self.options(action="add", target="root@host", create_local_node=False)
         with patch("builtins.input", side_effect=["", "2", "~/.ssh/my_key"]):
             deploy.configure_interactive(args, CONFIG)
         self.assertFalse(args.password)
         self.assertEqual(args.identity, "~/.ssh/my_key")
-        args = self.options(action="sync", target="root@host", create_local_node=False, password=True)
+        args = self.options(action="add", target="root@host", create_local_node=False, password=True)
         with patch("builtins.input", return_value="") as prompt:
             deploy.configure_interactive(args, CONFIG)
         self.assertEqual(prompt.call_count, 1)
@@ -201,14 +204,14 @@ class InteractiveTests(unittest.TestCase):
 
     def test_password_flag_cannot_be_combined_with_identity(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
-            deploy.main(["sync", "root@host", "--password", "--identity", "some-key"])
+            deploy.main(["add", "root@host", "--password", "--identity", "some-key"])
         self.assertEqual(error.exception.code, 2)
 
     def test_password_login_requires_a_terminal(self):
         with patch.object(deploy, "read_env", return_value=dict(CONFIG)), \
                 patch.object(deploy.sys.stdin, "isatty", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
-            deploy.main(["sync", "root@host", "--password"])
+            deploy.main(["add", "root@host", "--password"])
         self.assertEqual(error.exception.code, 2)
 
     def test_authentication_failure_prevents_upload_and_export(self):
@@ -228,7 +231,28 @@ class InteractiveTests(unittest.TestCase):
 
 
 class SSHTests(unittest.TestCase):
-    def test_password_authentication_is_terminal_only_and_reused(self):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        for patcher in (patch.object(deploy, 'ROOT', Path(temporary.name)),
+                        patch.dict(sys.modules, {'deploy': deploy}),
+                        patch.object(deploy.sys.stdin, 'isatty', return_value=True),
+                        patch.object(deploy.getpass, 'getpass', return_value='private-ssh-password')):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_bare_host_and_alias_default_to_root_and_explicit_user_is_preserved(self):
+        for target in ("example.invalid", "entry-alias"):
+            with self.subTest(target=target):
+                ssh = deploy.SSH(target, "/tmp/private")
+                self.assertEqual(ssh.options[-2:], ["-l", "root"])
+                self.assertEqual(ssh.target, target)
+        self.assertNotIn("-l", deploy.SSH("operator@example.invalid", "/tmp/private").options)
+        for port in (0, -1, 65536, True):
+            with self.subTest(port=port), self.assertRaises(deploy.DeployError):
+                deploy.SSH("entry-alias", "/tmp/private", port)
+
+    def test_password_authentication_uses_private_askpass_and_reuses_connection(self):
         ssh = deploy.SSH("root@example.invalid", "/tmp/private", 2222, password_login=True)
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"done")) as run:
             ssh.connect()
@@ -247,9 +271,10 @@ class SSHTests(unittest.TestCase):
         self.assertIn("-f", command)
         self.assertEqual(command[-2:], ["--", "root@example.invalid"])
         self.assertEqual(options["stdin"], subprocess.DEVNULL)
-        self.assertIsNone(options["stderr"])
+        self.assertEqual(options["stderr"], subprocess.PIPE)
         self.assertNotIn("input", options)
-        self.assertEqual(options["env"]["SSH_ASKPASS_REQUIRE"], "never")
+        self.assertEqual(options["env"]["SSH_ASKPASS_REQUIRE"], "force")
+        self.assertNotIn('private-ssh-password', repr(run.call_args_list))
         self.assertFalse(any("StrictHostKeyChecking=no" in item for item in command))
         self.assertNotIn("private-deployment-data", repr(run.call_args_list[0]))
         self.assertEqual(run.call_args_list[1].kwargs["input"], b"private-deployment-data")
@@ -282,6 +307,65 @@ class SSHTests(unittest.TestCase):
             with self.assertRaises(deploy.DeployError) as error:
                 ssh.run("false")
         self.assertNotIn("secret", str(error.exception))
+
+    def test_ssh_transport_diagnostics_are_classified_without_printing_stderr(self):
+        ssh = deploy.SSH("example.invalid", "/tmp/private")
+        for diagnostic, description in ((b"Permission denied", "认证被拒绝"),
+                                        (b"Could not resolve hostname", "无法解析"),
+                                        (b"Connection refused", "拒绝连接"),
+                                        (b"Host key verification failed", "主机指纹校验失败")):
+            with self.subTest(diagnostic=diagnostic), \
+                    patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 255, b"secret", diagnostic + b" secret")), \
+                    self.assertRaises(deploy.SSHCommandError) as error:
+                ssh.run("probe")
+            self.assertEqual(error.exception.exit_code, 255)
+            self.assertIn(description, str(error.exception))
+            self.assertNotIn("secret", str(error.exception))
+
+    def test_export_failures_report_specific_prerequisites_and_preserve_transport_errors(self):
+        from unittest.mock import Mock
+        ssh = Mock()
+        for code, message in ((101, "不是 root"), (102, "flock"), (103, "运行文件"), (104, "state.env"),
+                              (106, "运行时锁目录"), (107, "占用锁"), (108, "不属于"), (109, "完成标记")):
+            with self.subTest(code=code):
+                ssh.run.side_effect = deploy.SSHCommandError("hidden", code)
+                with self.assertRaisesRegex(deploy.DeployError, message):
+                    deploy.export_node(ssh)
+        transport = deploy.SSHCommandError("transport failed", 255)
+        ssh.run.side_effect = transport
+        with self.assertRaises(deploy.SSHCommandError) as error:
+            deploy.export_node(ssh)
+        self.assertIs(error.exception, transport)
+
+    def test_export_recreates_runtime_lock_after_reboot_and_rejects_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state, stages, runtime = root / "state.env", root / "stages", root / "run"
+            stages.mkdir()
+
+            def document(values):
+                return "".join(key + "=" + base64.b64encode(value.encode()).decode() + "\n" for key, value in values.items()).encode()
+
+            atomic_write(state, document(dict(NODE, MANAGED_BY="one-key-proxy")))
+            atomic_write(stages / "completed.done", document({"STAGE": "completed", "COMPLETED_AT": "2026-10-09T00:00:00Z"}))
+            script = deploy.EXPORT_SCRIPT.replace('[ "$owner" = 0 ]', f'[ "$owner" = {os.getuid()} ]')
+            script = script.replace("/usr/local/lib/one-key-proxy/lib/state.sh", str(ROOT / "lib/state.sh"))
+            script = script.replace("/etc/one-key-proxy/state.env", str(state)).replace("/run/one-key-proxy", str(runtime))
+            # BusyBox-compatible locking must work without flock's optional -w flag.
+            script = 'flock() { [ "$*" = "-s -n 9" ]; }\n' + script
+            environment = dict(os.environ, OKP_TEST_MODE="true", OKP_PRODUCTION_MODE="false",
+                               STATE_FILE=str(state), STAGE_DIR=str(stages))
+            result = subprocess.run(["bash", "-c", script], capture_output=True, env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(deploy.parse_export(result.stdout), NODE)
+            self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((runtime / "operation.lock").stat().st_mode & 0o777, 0o600)
+            (runtime / "operation.lock").unlink()
+            (runtime / "operation.lock").symlink_to(state)
+            before = state.read_bytes()
+            result = subprocess.run(["bash", "-c", script], capture_output=True, env=environment)
+            self.assertEqual(result.returncode, 106)
+            self.assertEqual(state.read_bytes(), before)
 
     def test_targets_cannot_inject_commands_or_options(self):
         for target in ("-oProxyCommand=bad", "host;id", "root@$(id)", "host\ncommand"):
@@ -483,7 +567,7 @@ class ResumeTests(unittest.TestCase):
         self.seed()
         self.state.path.write_text("{broken")
         with patch.object(deploy, "run_workflow"):
-            deploy.main(["sync", "root@new", "--fresh"])
+            deploy.main(["add", "root@new", "--fresh"])
         self.assertFalse(self.state.path.exists())
 
     def test_installed_vps_resume_skips_install_and_revalidates_identity(self):
@@ -509,7 +593,7 @@ class ResumeTests(unittest.TestCase):
                 patch.object(deploy.shutil, "which", return_value="ssh"), patch.object(deploy, "install") as install, \
                 patch.object(deploy, "export_node", return_value=NODE), \
                 patch.object(deploy.SublinkPro, "sync") as sync, contextlib.redirect_stdout(io.StringIO()), \
-                patch("builtins.input", side_effect=["Initial airport", "Initial node"]), \
+                patch("builtins.input", side_effect=["Initial airport", "Initial node", "n"]), \
                 patch.object(deploy, "SingBox"), \
                 contextlib.redirect_stderr(io.StringIO()):
             sync.side_effect = failed_sync
@@ -596,6 +680,16 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
         elif self.command == "GET" and path == "/api/v1/tags/node/tags":
             node_id = int(urllib.parse.parse_qs(parsed.query)["nodeId"][0])
             data = [{"name": name} for name in state["tags"].get(node_id, [])]
+        elif self.command == "GET" and path == "/api/v1/tags/list":
+            names = set(state.get("known_tags", [])) | {name for tags in state["tags"].values() for name in tags}
+            data = [{"name": name} for name in sorted(names)]
+        elif self.command == "POST" and path == "/api/v1/tags/add":
+            state.setdefault("known_tags", []).append(fields["name"])
+        elif self.command == "POST" and path == "/api/v1/tags/node/batch-set":
+            for node_id in fields["nodeIds"]:
+                state["tags"][node_id] = list(fields["tagNames"])
+            if state.pop("fail_tags_once", False):
+                code = 500
         elif self.command == "POST" and path == "/api/v1/nodes/batch-update-dialer-proxy":
             for node in state["nodes"]:
                 if node["ID"] in fields["ids"]:
@@ -611,6 +705,7 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                 uri = urllib.parse.urlsplit(fields["link"])
                 node.update(Protocol=uri.scheme, LinkHost=uri.hostname, LinkPort=uri.port)
                 if existing:
+                    node.update(Source=existing.get("Source", "manual"), SourceID=existing.get("SourceID", 0))
                     existing.update(node)
                 else:
                     state["nodes"].append(node)
@@ -795,8 +890,8 @@ class SublinkTests(unittest.TestCase):
         calls = self.server.state["calls"]
         self.assertFalse(any(path == "/api/v1/airports/11" or "nodeId=917" in path for _, path, _, _ in calls))
 
-    def test_local_port_is_required_and_validated_before_writes(self):
-        for port in (None, 0, -1, 65536, "not-a-port", "1.5"):
+    def test_local_port_is_validated_before_writes(self):
+        for port in (0, -1, 65536, "not-a-port", "1.5"):
             with self.subTest(port=port), self.assertRaises(deploy.DeployError):
                 self.client.sync(NODE, local_port=port)
         self.assertTrue(all(method == "GET" for method, _, _, _ in self.server.state["calls"]))
@@ -804,6 +899,65 @@ class SublinkTests(unittest.TestCase):
             self.assertEqual(deploy.SublinkPro.local_port(port), port)
         with patch("builtins.input", side_effect=["", "0", "65536", "7900"]):
             self.assertEqual(deploy.SublinkPro.local_port(None, interactive=True), 7900)
+
+    def test_new_port_default_accepts_enter_and_is_checkpointed(self):
+        saved = {}
+        with patch.object(self.client, "available_local_port", return_value=7901) as allocate, \
+                patch("builtins.input", side_effect=["Airport", "Node", ""]) as prompt:
+            self.client.sync(NODE, interactive=True, on_input=lambda **values: saved.update(values))
+        self.assertEqual(saved["local_port"], 7901)
+        self.assertIn("[7901]", prompt.call_args.args[0])
+        self.assertEqual(urllib.parse.urlsplit(self.server.state["nodes"][0]["Link"]).port, 7901)
+        allocate.assert_called_once()
+
+    def test_port_choice_keeps_existing_port_and_allows_explicit_override(self):
+        with patch.object(self.client, "available_local_port", side_effect=AssertionError("must reuse existing port")), \
+                patch("builtins.input", side_effect=AssertionError("must not prompt for an ordinary update")):
+            self.assertEqual(self.client.choose_local_port(default=7900, interactive=True), 7900)
+            self.assertEqual(self.client.choose_local_port(7902, default=7900, interactive=True), 7902)
+        with patch("builtins.input", return_value="") as prompt:
+            self.assertEqual(self.client.choose_local_port(default=7900, interactive=True, prompt=True), 7900)
+        self.assertIn("[7900]", prompt.call_args.args[0])
+
+    def test_invalid_port_input_retains_suggested_default(self):
+        with patch.object(self.client, "available_local_port", return_value=7901), \
+                patch("builtins.input", side_effect=["0", "65536", ""]), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.client.choose_local_port(interactive=True), 7901)
+
+    def test_allocator_skips_sublink_configured_and_listening_ports(self):
+        self.server.state["nodes"] = [dict(SS_TEMPLATE, ID=999)]
+        path = deploy.ROOT / "singbox.json"
+        path.write_text(json.dumps({"inbounds": [{"type": "mixed", "tag": "occupied", "listen_port": 7897}],
+                                   "outbounds": [{"type": "direct", "tag": "direct"}], "route": {}}))
+        path.chmod(0o600)
+        self.client.box_config = {"SINGBOX_CONFIG": str(path), "SINGBOX_BINARY": sys.executable, "SINGBOX_SERVICE_LABEL": "test"}
+        with patch.object(sys, "platform", "darwin"), \
+                patch.object(self.client, "port_available", side_effect=lambda port: port != 7898) as probe:
+            self.assertEqual(self.client.available_local_port(), 7899)
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [7898, 7899])
+        self.assertTrue(all(method == "GET" for method, _, _, _ in self.server.state["calls"]))
+
+    def test_port_probe_detects_tcp_udp_and_closes_sockets(self):
+        for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+            with self.subTest(kind=kind), socket.socket(socket.AF_INET, kind) as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+                self.assertFalse(deploy.SublinkPro.port_available(port))
+            self.assertTrue(deploy.SublinkPro.port_available(port))
+            self.assertTrue(deploy.SublinkPro.port_available(port))
+
+    def test_port_probe_errors_are_not_treated_as_occupied_ports(self):
+        with patch.object(deploy.socket, "socket", side_effect=OSError(errno.EMFILE, "unsafe diagnostics")), \
+                self.assertRaises(deploy.DeployError) as error:
+            deploy.SublinkPro.port_available(7901)
+        self.assertNotIn("unsafe diagnostics", str(error.exception))
+
+    def test_allocator_includes_last_port_and_fails_when_exhausted(self):
+        with patch.object(deploy, "LOCAL_SS_PORT_START", 65535), patch.object(self.client, "port_available", return_value=True):
+            self.assertEqual(self.client.choose_local_port(), 65535)
+        with patch.object(deploy, "LOCAL_SS_PORT_START", 65535), patch.object(self.client, "port_available", return_value=False), \
+                self.assertRaisesRegex(deploy.DeployError, "没有可自动分配"):
+            self.client.choose_local_port()
 
     def test_uncertain_local_write_reuses_node_and_port_on_retry(self):
         self.server.state["fail_after_local_write"] = True

@@ -6,8 +6,10 @@ import base64
 import binascii
 import contextlib
 import copy
+import errno
 import fcntl
 import graphlib
+import getpass
 import io
 import json
 import os
@@ -16,6 +18,7 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -27,10 +30,12 @@ import urllib.parse
 import urllib.request
 import uuid
 from deploy_resources import DeployError, ManagedDeployments, SingBox, configuration_label, is_standalone
-from deploy_templates import AIRPORT_DEFAULTS, LOCAL_SS_METHOD, LOCAL_SS_GROUP, LOCAL_SS_TAGS
+from deploy_templates import AIRPORT_DEFAULTS, LOCAL_SS_METHOD, LOCAL_SS_PORT_START, LOCAL_SS_GROUP, LOCAL_SS_TAGS, RESIDENTIAL_TAG, residential_tags
 from deploy_subscription import subscription_export, validate_url
 from deploy_links import parse_node_link
 from deploy_nodes import NodeManager
+from deploy_relay import RemoteRelayManager, is_remote_relay, manage_remote, sync_dependents
+from deploy_parts import complete_part, has_source, parts
 
 
 ROOT = Path(__file__).resolve().parent
@@ -50,17 +55,35 @@ RESUME_TYPES = {
     "local_port": int, "create_local_node": bool, "no_sync": bool, "auth_method": str,
     "relay": str, "source": str, "subscription_url": str, "insecure_subscription": bool,
     "subscription_node": str,
-    "node_link": str, "local_link": str, "same_local": bool, "adopt_node": int,
+    "node_link": str, "local_link": str, "same_local": bool, "adopt_node": int, "residential": bool,
+    "part": str,
+    "source_type": str,
 }
 
 
 class ResumeState:
     """Private atomic checkpoints; subscription URLs may contain access tokens."""
 
-    def __init__(self, directory=None):
+    def __init__(self, directory=None, *, node_id=None):
         self.directory = Path(directory) if directory is not None else ROOT / ".deploy-state"
-        self.path = self.directory / "pending.json"
+        if node_id is not None and not re.fullmatch(r"[0-9a-f]{32}", node_id):
+            raise DeployError("节点编辑恢复记录的管理 ID 无效。")
+        self.node_id = node_id
+        self.path = self.directory / (f"edit-{node_id}.json" if node_id else "pending.json")
         self.data = None
+
+    def resume_command(self):
+        return (f"python3 deploy.py edit {self.node_id} --resume" if self.node_id
+                else "python3 deploy.py --resume")
+
+    def recovery_hint(self):
+        if not sys.stdin.isatty():
+            return f"运行 {self.resume_command()} 可继续。"
+        action = self.data["options"]["action"] if self.data else None
+        if self.node_id or action == "edit":
+            return "请从“查看配置”进入该节点的编辑菜单，选择“继续上次”。"
+        menu = "安装配置" if action == "install" else "添加配置"
+        return f"请从主菜单进入“{menu}”，选择“继续上次”。"
 
     def check_directory(self):
         info = self.directory.lstat()
@@ -81,7 +104,7 @@ class ResumeState:
     def validate(data):
         try:
             if (not isinstance(data, dict) or set(data) != {"version", "phase", "installation_id", "options"}
-                    or type(data["version"]) is not int or data["version"] != 1
+                    or type(data["version"]) is not int or data["version"] != 2
                     or data["phase"] not in ("input", "install", "sync") or not isinstance(data["options"], dict)):
                 raise ValueError
             identity = data["installation_id"]
@@ -93,9 +116,9 @@ class ResumeState:
                     raise ValueError
                 if isinstance(value, str) and (len(value) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value)):
                     raise ValueError
-            if options.get("action") not in ("install", "add", "sync", "edit") or not Path(options["env_file"]).is_absolute():
+            if options.get("action") not in ("install", "add", "edit") or not Path(options["env_file"]).is_absolute():
                 raise ValueError
-            if options.get("source") not in (None, "ssh", "subscription", "node"):
+            if options.get("source") not in (None, "ssh", "subscription", "node", "partial"):
                 raise ValueError
             if options.get("adopt_node") is not None and options["adopt_node"] <= 0:
                 raise ValueError
@@ -128,8 +151,15 @@ class ResumeState:
         except (ValueError, UnicodeError):
             raise DeployError("恢复记录无法解析；请检查 .deploy-state/pending.json。") from None
         self.validate(data)
+        self.validate_scope(data)
         self.data = data
         return data
+
+    def validate_scope(self, data):
+        if not self.node_id and data["options"]["action"] == "edit":
+            raise DeployError("节点编辑必须使用对应管理 ID 的恢复记录。")
+        if self.node_id and (data["options"]["action"] != "edit" or data["installation_id"] != self.node_id):
+            raise DeployError("节点编辑恢复记录与当前管理 ID 不一致。")
 
     @contextlib.contextmanager
     def locked(self):
@@ -147,6 +177,7 @@ class ResumeState:
 
     def save(self):
         self.validate(self.data)
+        self.validate_scope(self.data)
         fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=self.directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -160,7 +191,7 @@ class ResumeState:
                 os.unlink(temporary)
 
     def start(self, action, env_file):
-        self.data = {"version": 1, "phase": "input", "installation_id": None,
+        self.data = {"version": 2, "phase": "input", "installation_id": self.node_id,
                      "options": {"action": action, "env_file": str(env_file)}}
         self.save()
 
@@ -180,6 +211,33 @@ class ResumeState:
     def complete(self):
         self.path.unlink()
         self.data = None
+
+
+def workflow_checkpoint(args, supplied, state):
+    if args.action != "edit" or args.target is None:
+        previous = state.load() if args.resume else None
+        if (args.action in (None, "edit") and args.resume
+                and (previous is None or (args.action == "edit" and previous["options"]["action"] != "edit"))):
+            identities = [path.stem[5:] for path in sorted(state.directory.glob("edit-*.json"))
+                          if re.fullmatch(r"edit-[0-9a-f]{32}\.json", path.name)]
+            if len(identities) > 1:
+                if sys.stdin.isatty():
+                    raise DeployError("有多个未完成的节点编辑，请从“查看配置”进入对应节点，选择“继续节点变更”。")
+                raise DeployError("有多个未完成的节点编辑，请进入对应节点继续，或用 edit 管理ID --resume 指定。")
+            if identities:
+                return ResumeState(state.directory, node_id=identities[0])
+        return state
+
+    registry = ManagedDeployments(state)
+    identity = registry.select(args.target)
+    args.target = supplied["target"] = identity
+    checkpoint = ResumeState(state.directory, node_id=identity)
+    previous = state.load()
+    if previous:
+        previous_id = previous["installation_id"]
+        if previous_id and previous_id.lower() == identity:
+            raise DeployError("此节点的安装或添加尚未完成，请先从安装 / 添加配置继续原流程。")
+    return checkpoint
 
 
 def local_node_default(config):
@@ -212,8 +270,8 @@ def prompt_yes_no(label, default):
 
 
 def choose_action(pending=None):
-    print("\nOne-Key-Proxy\n  1. 安装配置\n  2. 添加配置\n  3. 删除配置\n  4. 查看配置\n  5. 检查环境\n  0. 退出")
-    choices = {"1": "install", "2": "add", "3": "remove", "4": "list", "5": "check", "0": None, "q": None}
+    print("\nOne-Key-Proxy\n  1. 安装配置\n  2. 添加配置\n  3. 删除配置\n  4. 查看配置\n  5. 更新面板\n  6. 检查环境\n  0. 退出")
+    choices = {"1": "install", "2": "add", "3": "remove", "4": "list", "5": "update-panels", "6": "check", "0": None, "q": None}
     while True:
         value = prompt_text("请选择", "0").lower()
         if value in choices:
@@ -221,13 +279,41 @@ def choose_action(pending=None):
         print("请输入菜单中的编号。", file=sys.stderr)
 
 
-def choose_pending(pending):
+def checkpoint_can_restart(checkpoint, pending):
+    editing = pending["options"]["action"] == "edit"
+    if editing or pending["options"].get("source") == "node":
+        identity = pending["installation_id"]
+        registry = ManagedDeployments(checkpoint)
+        record = registry.records.get(identity)
+        journal = checkpoint.directory / ("node-change-" + identity + ".json") if identity else None
+        if journal and journal.exists():
+            return False
+        if not record:
+            return not editing
+        unused = (record["kind"] in ("node", "adopted") and record["status"] == "syncing"
+                  and not any(record[key] for key in ("airport_id", "local_node_id", "singbox", "remote_fingerprints"))
+                  and (record["remote_node_id"] is None or record["kind"] == "adopted")
+                  and not registry.dependents(identity))
+        return record["status"] == "active" or (not editing and unused)
+    return True
+
+
+def choose_pending(pending, *, can_restart=None):
+    editing = pending["options"]["action"] == "edit"
     phase = {"input": "填写配置", "install": "安装 VPS", "sync": "添加配置"}[pending["phase"]]
-    print(f"\n存在未完成的流程（{phase}）。\n  1. 继续上次\n  2. 重新开始\n  0. 返回")
+    if editing:
+        phase = {"input": "填写节点编辑", "sync": "应用节点变更"}.get(pending["phase"], phase)
+    if can_restart is None:
+        can_restart = not (pending["phase"] == "sync" and (editing or pending["options"].get("source") == "node"))
+    print(f"\n存在未完成的流程（{phase}）。\n  1. 继续上次")
+    if can_restart:
+        print("  2. 重新开始")
+    print("  0. 返回")
     while True:
         value = prompt_text("请选择", "1")
-        if value in ("0", "1", "2"):
+        if value in (("0", "1", "2") if can_restart else ("0", "1")):
             return value
+        print("请输入菜单中的编号。", file=sys.stderr)
 
 
 def configure_interactive(args, config, checkpoint=None):
@@ -239,7 +325,7 @@ def configure_interactive(args, config, checkpoint=None):
         if checkpoint:
             checkpoint.capture(**values)
 
-    if args.action in ("add", "sync"):
+    if args.action == "add":
         if not getattr(args, "source", None):
             if getattr(args, "subscription_url", None):
                 remember(source="subscription")
@@ -247,10 +333,12 @@ def configure_interactive(args, config, checkpoint=None):
                 remember(source="ssh")
             else:
                 while True:
-                    value = prompt_text("配置来源（1=SSH，2=订阅地址，3=单条节点链接）", "1")
-                    if value in ("1", "2", "3"):
-                        remember(source={"1": "ssh", "2": "subscription", "3": "node"}[value])
+                    value = prompt_text("配置来源（1=本项目 VPS / SSH，2=订阅地址，3=单条节点链接，4=稍后补全）", "1")
+                    if value in ("1", "2", "3", "4"):
+                        remember(source={"1": "ssh", "2": "subscription", "3": "node", "4": "partial"}[value])
                         break
+        if args.source == "partial":
+            return
         if args.source == "node":
             if not getattr(args, "node_link", None):
                 remember(node_link=prompt_text("节点链接", required=True))
@@ -314,7 +402,7 @@ def configure_interactive(args, config, checkpoint=None):
 
 def configure_integration(args, config, checkpoint, remember):
     if (not args.no_sync and (config.get("SUBLINKPRO_URL") or config.get("SUBLINKPRO_API_KEY")
-                              or args.action in ("add", "sync"))
+                              or args.action == "add")
             and args.create_local_node is None and args.local_port is None):
         remember(create_local_node=prompt_yes_no("是否启用本地节点（sing-box + SublinkPro）", local_node_default(config)))
     if checkpoint and not args.no_sync and getattr(args, "relay", None) is None and not checkpoint.answered("relay"):
@@ -338,7 +426,7 @@ def configure_resource_names(args, config, checkpoint, interactive):
     identity = checkpoint.data["installation_id"]
     if getattr(args, "source", None) == "subscription":
         identity = subscription_export(args.subscription_url, service_url)["INSTALLATION_ID"]
-    matches = [record for key, record in registry.records.items()
+    matches = [(key, record) for key, record in registry.records.items()
                if record["status"] == "active" and record["sublink_url"] == service_url
                and (key == identity if identity else record["target"] == args.target)]
     existing = len(matches) == 1
@@ -360,6 +448,7 @@ def configure_resource_names(args, config, checkpoint, interactive):
             value = SublinkPro.custom_name(value, "", label, False)
         setattr(args, option, value)
         checkpoint.capture(**{option: value})
+    return matches[0] if existing else None
 
 
 def read_env(path):
@@ -409,6 +498,7 @@ def build_archive(config, root=ROOT):
     paths = [Path(name) for name in
              ("bootstrap.sh", "install.sh", "maintenance.sh", "one-key-proxy", "VERSION")]
     paths.extend(path.relative_to(root) for path in sorted((root / "lib").glob("*.sh")))
+    paths.extend(path.relative_to(root) for path in sorted((root / "lib").glob("*.py")))
     with tarfile.open(fileobj=output, mode="w") as archive:
         for relative in paths:
             path = root / relative
@@ -428,14 +518,32 @@ def build_archive(config, root=ROOT):
 
 EXPORT_SCRIPT = """
 set -eu
-[ "$(id -u)" = 0 ] || exit 1
-exec 9>/run/one-key-proxy/operation.lock
-flock -s -w 10 9 || exit 1
-. /usr/local/lib/one-key-proxy/lib/state.sh
-[ "$(state_get MANAGED_BY)" = one-key-proxy ] || exit 1
-stage_is_done completed || exit 1
+owner=$(id -u)
+[ "$owner" = 0 ] || exit 101
+command -v flock >/dev/null 2>&1 || exit 102
+[ -r /usr/local/lib/one-key-proxy/lib/state.sh ] || exit 103
+[ -f /etc/one-key-proxy/state.env ] || exit 104
+. /usr/local/lib/one-key-proxy/lib/state.sh || exit 105
+lock_dir=/run/one-key-proxy
+lock_file=$lock_dir/operation.lock
+[ ! -L "$lock_dir" ] && { [ ! -e "$lock_dir" ] || [ -d "$lock_dir" ]; } || exit 106
+umask 077
+mkdir -p "$lock_dir" || exit 106
+[ "$(_state_file_attribute "$lock_dir" '%u' '%u')" = "$owner" ] || exit 106
+chmod 0700 "$lock_dir" || exit 106
+[ ! -L "$lock_file" ] && { [ ! -e "$lock_file" ] || _state_secure_regular_file "$lock_file"; } || exit 106
+exec 9>"$lock_file" || exit 106
+chmod 0600 "$lock_file" || exit 106
+locked=false
+for attempt in {1..50}; do
+    if flock -s -n 9; then locked=true; break; fi
+    sleep 0.2
+done
+[ "$locked" = true ] || exit 107
+[ "$(state_get MANAGED_BY)" = one-key-proxy ] || exit 108
+stage_is_done completed || exit 109
 for key in INSTALLATION_ID NODE_NAME SUBSCRIPTION_URL MODE VLESS_URI; do
-    value=$(state_get "$key") || exit 1
+    value=$(state_get "$key") || exit 110
     printf '%s=%s\\n' "$key" "$(_state_encode "$value")"
 done
 """
@@ -472,6 +580,16 @@ def parse_export(document):
     return result
 
 
+class SSHCommandError(DeployError):
+    def __init__(self, message, exit_code):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+class SSHExportError(SSHCommandError):
+    pass
+
+
 class SSH:
     def __init__(self, target, socket_dir, port=None, identity=None, *, password_login=False):
         if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.:@\[\]-]*", target):
@@ -479,17 +597,21 @@ class SSH:
         if password_login and identity:
             raise DeployError("Choose either password login or an explicit SSH identity.")
         self.target = target
+        self.port = port
         self.password_login = password_login
         self.connected = False
+        self.environment = None
         self.options = [
-            "ssh", "-o", "ControlMaster=auto", "-o", "ControlPersist=60",
+            "ssh", "-o", "ControlMaster=auto", "-o", "ControlPersist=1800",
             "-o", f"ControlPath={socket_dir}/ssh.sock", "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
             "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
             "-o", "ClearAllForwardings=yes", "-o", "RemoteCommand=none",
         ]
-        if port:
-            if not 1 <= port <= 65535:
+        if "@" not in target:
+            self.options += ["-l", "root"]
+        if port is not None:
+            if type(port) is not int or not 1 <= port <= 65535:
                 raise DeployError("SSH port must be between 1 and 65535.")
             self.options += ["-p", str(port)]
         if identity:
@@ -499,24 +621,40 @@ class SSH:
                 "-o", "PreferredAuthentications=password,keyboard-interactive",
                 "-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=yes",
                 "-o", "KbdInteractiveAuthentication=yes", "-o", "BatchMode=no",
-                "-o", "NumberOfPasswordPrompts=3",
+                "-o", "NumberOfPasswordPrompts=1",
             ]
 
     def connect(self):
         if self.connected:
             return
-        # OpenSSH reads passwords from the terminal before -f backgrounds the master.
-        # Authenticate without a remote command or deployment data on standard input.
         environment = dict(os.environ)
         if self.password_login:
-            environment["SSH_ASKPASS_REQUIRE"] = "never"
+            from deploy_credentials import Credentials
+            credentials = Credentials()
+            if credentials.ssh(self.target, self.port) is None:
+                if not sys.stdin.isatty():
+                    raise DeployError("首次密码登录需要交互终端；已保存的 SSH 密码可自动复用。")
+                try:
+                    password = getpass.getpass(f"{self.target} 的 SSH 密码（输入隐藏）: ")
+                except EOFError:
+                    raise DeployError("已取消 SSH 密码输入。") from None
+                credentials.save_ssh(self.target, self.port, password)
+            environment.update(SSH_ASKPASS=str(ROOT / 'deploy_ssh_askpass.py'), SSH_ASKPASS_REQUIRE='force',
+                               OKP_SSH_TARGET=self.target, OKP_SSH_PORT=str(self.port or 22),
+                               OKP_SSH_CREDENTIAL_DIR=str(credentials.state.directory))
+            environment.setdefault('DISPLAY', 'one-key-proxy:0')
+        self.environment = environment
         try:
             result = subprocess.run(self.options + ["-N", "-f", "--", self.target],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=None, env=environment, timeout=180, check=False)
+                                    stderr=subprocess.PIPE if self.password_login else None,
+                                    env=environment, timeout=180, check=False)
         except subprocess.TimeoutExpired:
             raise DeployError("SSH 登录超时，请重试。") from None
         if result.returncode:
+            if self.password_login and isinstance(result.stderr, bytes) and b'Permission denied' in result.stderr:
+                credentials.forget_ssh(self.target, self.port)
+                raise DeployError("SSH 密码认证失败，已清除保存的密码；从原菜单继续时可重新输入。")
             raise DeployError("SSH 登录失败，请检查主机、用户名、密码或密钥，以及服务端允许的认证方式。")
         self.connected = True
 
@@ -526,11 +664,22 @@ class SSH:
             result = subprocess.run(command, input=data, check=False,
                                     stdout=None if interactive else subprocess.PIPE,
                                     stderr=None if interactive else subprocess.PIPE,
-                                    timeout=None if interactive else timeout)
+                                    timeout=None if interactive else timeout, env=self.environment)
         except subprocess.TimeoutExpired:
             raise DeployError("SSH operation timed out. Check VPS connectivity and retry.") from None
         if result.returncode:
-            raise DeployError("SSH operation failed. Check SSH login, root access and remote prerequisites.")
+            detail = ""
+            diagnostic = result.stderr if isinstance(result.stderr, bytes) else b""
+            for pattern, message in ((b"Permission denied", "认证被拒绝，请核对用户名和服务端允许的登录方式。"),
+                                     (b"Could not resolve hostname", "无法解析 SSH 主机名。"),
+                                     (b"Connection refused", "SSH 端口拒绝连接。"),
+                                     (b"Connection timed out", "SSH 连接超时。"),
+                                     (b"Host key verification failed", "SSH 主机指纹校验失败，请核对 known_hosts。"),
+                                     (b"REMOTE HOST IDENTIFICATION HAS CHANGED", "SSH 主机指纹发生变化，请先核实服务器身份。")):
+                if pattern in diagnostic:
+                    detail = message
+                    break
+            raise SSHCommandError(f"SSH 远端命令执行失败（退出码 {result.returncode}）。" + detail, result.returncode)
         return result.stdout
 
     def close(self):
@@ -571,7 +720,26 @@ def install(ssh, config):
 
 def export_node(ssh):
     command = "env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root "
-    return parse_export(ssh.run(command + "bash -c " + shlex.quote(EXPORT_SCRIPT)))
+    try:
+        raw = ssh.run(command + "bash -c " + shlex.quote(EXPORT_SCRIPT))
+    except SSHCommandError as error:
+        reasons = {
+            101: "SSH 已连接，但当前用户不是 root。请使用 root 登录。",
+            102: "SSH 已连接，但入口缺少 flock，无法安全读取安装状态。",
+            103: "SSH 已连接，但入口缺少本项目运行文件。请先在该入口安装或更新 one-key-proxy。",
+            104: "SSH 已连接，但入口不存在 /etc/one-key-proxy/state.env。本机接管节点不等于服务器已由本项目管理。",
+            105: "SSH 已连接，但入口的项目状态读取程序无效。",
+            106: "SSH 已连接，但无法创建或校验入口的运行时锁目录。",
+            107: "SSH 已连接，但入口有其他操作占用锁，读取安装状态超时。",
+            108: "SSH 已连接，但入口的安装状态不属于 one-key-proxy，拒绝绑定。",
+            109: "SSH 已连接，但入口尚无有效的安装完成标记，请先完成或恢复入口安装。",
+            110: "SSH 已连接，但入口安装状态缺少必要的导出字段。",
+            127: "SSH 已连接，但入口无法启动 Bash，请检查远端环境。",
+        }
+        if error.exit_code in reasons:
+            raise SSHExportError(reasons[error.exit_code], error.exit_code) from None
+        raise
+    return parse_export(raw)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -584,6 +752,7 @@ class SublinkPro:
         self.url = config.get("SUBLINKPRO_URL", "").rstrip("/")
         self.key = config.get("SUBLINKPRO_API_KEY", "")
         self.group = config.get("SUBLINKPRO_GROUP")
+        self.box_config = {key: config[key] for key in ("SINGBOX_CONFIG", "SINGBOX_BINARY", "SINGBOX_SERVICE_LABEL") if key in config}
         self.create_local_node = local_node_default(config) if create_local_node is None else create_local_node
         try:
             parsed = urllib.parse.urlsplit(self.url)
@@ -692,24 +861,79 @@ class SublinkPro:
             raise DeployError("Node tags cannot be preserved through the update API.")
         return names
 
+    def ensure_tag(self, name):
+        def exists():
+            tags = self.request("tags/list")
+            if not isinstance(tags, list) or any(not isinstance(tag, dict) or not isinstance(tag.get("name"), str) for tag in tags):
+                raise DeployError("无法核验 SublinkPro 标签列表。")
+            return any(tag["name"] == name for tag in tags)
+
+        if exists():
+            return
+        try:
+            self.request("tags/add", {"name": name})
+        except DeployError:
+            if not exists():
+                raise
+        if not exists():
+            raise DeployError("新增标签回读不一致，请继续原操作。")
+
     @staticmethod
-    def local_port(value, default=None, interactive=False):
-        if value is None and default is not None:
-            return default
+    def local_port(value, default=None, interactive=False, *, prompt=False):
+        if value is None and default is not None and not (interactive and prompt):
+            value = default
         while True:
             if value is None:
                 if not interactive:
                     raise DeployError("First local-node import requires --local-port (1-65535).")
                 try:
-                    value = input("Surge 设备的本地 Shadowsocks 端口（1-65535）: ").strip()
+                    suffix = f" [{default}]" if default is not None else ""
+                    value = input("Surge 设备的本地 Shadowsocks 端口（1-65535）" + suffix + ": ").strip()
+                    if not value and default is not None:
+                        value = default
                 except EOFError:
-                    raise DeployError("Port input cancelled; retry sync with --local-port.") from None
+                    raise DeployError("Port input cancelled; retry add with --local-port.") from None
             if re.fullmatch(r"[0-9]{1,5}", str(value)) and 1 <= int(value) <= 65535:
                 return int(value)
             if not interactive:
                 raise DeployError("Local Shadowsocks port must be between 1 and 65535.")
             print("请输入 1 到 65535 之间的整数。", file=sys.stderr)
             value = None
+
+    @staticmethod
+    def port_available(port):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                tcp.bind(("127.0.0.1", port))
+                udp.bind(("127.0.0.1", port))
+            return True
+        except OSError as error:
+            if error.errno in (errno.EADDRINUSE, errno.EACCES):
+                return False
+            raise DeployError("无法检查本地端口占用，请稍后重试。") from None
+
+    def available_local_port(self):
+        used = set()
+        for node in self.all_nodes():
+            try:
+                uri = urllib.parse.urlsplit(node.get("Link", ""))
+                if uri.scheme == "ss" and uri.hostname in ("127.0.0.1", "localhost", "::1") and uri.port:
+                    used.add(uri.port)
+            except (ValueError, TypeError):
+                continue
+        if self.box_config.get("SINGBOX_CONFIG"):
+            _, document = SingBox(self.box_config).read()
+            used.update(item["listen_port"] for item in document["inbounds"] if type(item.get("listen_port")) is int)
+        for port in range(LOCAL_SS_PORT_START, 65536):
+            if port not in used and self.port_available(port):
+                return port
+        raise DeployError("没有可自动分配的本地 Shadowsocks 端口，请手动指定 --local-port。")
+
+    def choose_local_port(self, value=None, default=None, interactive=False, *, prompt=False):
+        if value is None and default is None:
+            default = self.available_local_port()
+            prompt = True
+        return self.local_port(value, default, interactive, prompt=prompt)
 
     @staticmethod
     def airport_node_name(fields, default):
@@ -736,7 +960,7 @@ class SublinkPro:
         else:
             auth = base64.urlsafe_b64encode(f"{LOCAL_SS_METHOD}:{secrets.token_urlsafe(32)}".encode()).decode().rstrip("=")
             uri = urllib.parse.urlsplit(f"ss://{auth}@127.0.0.1:1")
-        port = self.local_port(port, uri.port if existing else None, interactive)
+        port = self.choose_local_port(port, uri.port if existing else None, interactive)
         if on_input:
             on_input(local_port=port)
         # Updates retain credentials; new nodes receive independent random passwords.
@@ -779,7 +1003,7 @@ class SublinkPro:
                        (("Name", "name"), ("Link", "link"), ("NameMode", "nameMode"),
                         ("Group", "group"), ("DialerProxyName", "dialerProxyName")))
                 or set(self.node_tags(verified["ID"])) != set(fields["tags"].split(",") if fields["tags"] else [])):
-            raise DeployError("Local node sync could not be verified; retry sync to reconcile it.")
+            raise DeployError("Local node sync could not be verified; retry add to reconcile it.")
         return verified
 
     def all_nodes(self):
@@ -809,7 +1033,9 @@ class SublinkPro:
                 raise DeployError("受管机场不存在或身份不匹配。")
             return [node for node in self.all_nodes() if node.get("SourceID") == airport["id"]]
         node = self.find_remote_node(identity)
-        if not node or node["ID"] != record.get("remote_node_id"):
+        if not node:
+            raise DeployError("受管远端节点不存在或已丢失所有权标识，请先核对 SublinkPro 中的节点。")
+        if node["ID"] != record.get("remote_node_id"):
             raise DeployError("受管远端节点不存在或身份不匹配。")
         return [node]
 
@@ -822,7 +1048,7 @@ class SublinkPro:
             raise DeployError("中转部署没有唯一的远端节点，请先核验机场节点。")
         return nodes[0]
 
-    def apply_relay(self, identity, record, relay_node, wait=False):
+    def prepare_relay(self, identity, record, relay_node, wait=False):
         nodes = self.remote_nodes(identity, record)
         deadline = time.monotonic() + (25 if wait and relay_node else 0)
         while not nodes and time.monotonic() < deadline:
@@ -831,7 +1057,7 @@ class SublinkPro:
         if not nodes:
             if relay_node:
                 raise DeployError("机场节点尚未拉取，无法设置中转；稍后重试同步。")
-            return
+            return set(), "", False
         name = relay_node["Name"] if relay_node else ""
         all_nodes = self.all_nodes()
         ids = {node["ID"] for node in nodes}
@@ -841,7 +1067,13 @@ class SublinkPro:
             tuple(graphlib.TopologicalSorter(graph).static_order())
         except graphlib.CycleError:
             raise DeployError("SublinkPro 链式代理会形成循环。") from None
-        if any(node.get("DialerProxyName", "") != name for node in nodes):
+        return ids, name, any(node.get("DialerProxyName", "") != name for node in nodes)
+
+    def apply_relay(self, identity, record, relay_node, wait=False):
+        ids, name, changed = self.prepare_relay(identity, record, relay_node, wait)
+        if not ids:
+            return
+        if changed:
             self.request("nodes/batch-update-dialer-proxy", {"ids": sorted(ids), "dialerProxyName": name})
         verified = self.remote_nodes(identity, record)
         if {node["ID"] for node in verified} != ids or any(node.get("DialerProxyName", "") != name for node in verified):
@@ -916,13 +1148,13 @@ class SublinkPro:
             try:
                 value = (input(f"{display_label} [{default}]: ").strip() or default) if interactive else default
             except EOFError:
-                raise DeployError("Name input cancelled. Supply --airport-name and --node-name to sync again.") from None
+                raise DeployError("Name input cancelled. Supply --airport-name and --node-name to add again.") from None
         if not value.strip() or len(value) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in value):
             raise DeployError(f"{label} must contain 1-80 characters without control characters.")
         return value.strip()
 
     def sync(self, exported, *, airport_name=None, node_name=None, local_port=None, interactive=False, on_input=None,
-             registry=None, singbox=None, relay_requested=False):
+             registry=None, singbox=None, relay_requested=False, residential=None):
         if not self.create_local_node and local_port is not None:
             raise DeployError("Local node sync is disabled; omit --local-port or enable --local-node.")
         marker = "[okp:" + exported["INSTALLATION_ID"].lower() + "]"
@@ -965,11 +1197,13 @@ class SublinkPro:
             local_name = self.custom_name(self.airport_node_name(fields, exported["NODE_NAME"]),
                                           exported["NODE_NAME"], "Node name", False)
             local_node, local_fields = self.prepare_local_node(local_marker, local_name, local_port, interactive, on_input)
+            local_fields["tags"] = ",".join(residential_tags(
+                local_fields["tags"].split(",") if local_fields["tags"] else [], residential))
             if singbox:
                 if registry is None:
                     raise DeployError("sing-box 同步需要持久资源清单。")
                 singbox_plan = singbox.plan(identity, exported["VLESS_URI"], local_fields["link"],
-                                           registry.records[identity]["singbox"], name=local_name, relay_tag=relay_tag)
+                                           registry.records[identity]["singbox"], relay_tag=relay_tag)
         if registry:
             values = {"airport_name": airport_name}
             if node_name is not None:
@@ -987,7 +1221,7 @@ class SublinkPro:
         actual = dict(self.settings(verified), name=verified["name"], url=verified["url"]) if verified else {}
         if (not verified or (airport and verified["id"] != airport["id"])
                 or any(actual.get(key) != value for key, value in fields.items())):
-            raise DeployError("SublinkPro sync could not be verified; run sync again to reconcile it.")
+            raise DeployError("SublinkPro sync could not be verified; run add again to reconcile it.")
         if registry:
             registry.update(identity, airport_id=verified["id"])
         # Creation of an enabled airport starts a fetch in SublinkPro. Updates do not.
@@ -1019,13 +1253,31 @@ def run_workflow(args, parser, wizard, checkpoint=None, resume_sync=False):
     config = read_env(args.env_file)
     if wizard and args.action != "edit":
         configure_interactive(args, config, checkpoint)
+    if args.source == "partial":
+        registry = ManagedDeployments(checkpoint)
+        client = SublinkPro(config, create_local_node=False)
+        name = args.name or prompt_text("配置名称", required=True)
+        name = client.custom_name(name, "", "配置名称", False)
+        checkpoint.capture(name=name)
+        if args.residential is None:
+            args.residential = prompt_yes_no("该配置是否为家宽", False) if sys.stdin.isatty() else False
+            checkpoint.capture(residential=args.residential)
+        identity = checkpoint.data["installation_id"] or uuid.uuid4().hex
+        checkpoint.phase("input", identity)
+        if identity not in registry.records:
+            registry.register(identity, "node:" + identity, args.env_file, client.url, name, kind="node")
+        registry.update(identity, node_name=name, residential=args.residential, status="active")
+        print("配置已保存，可从‘查看配置 → 编辑配置’按需补全。")
+        return
     if args.action == "edit" or getattr(args, "source", None) == "node":
         run_node_workflow(args, config, checkpoint, wizard)
         return
     if args.password and args.action != "check" and not sys.stdin.isatty():
-        parser.error("password login requires an interactive terminal")
+        from deploy_credentials import Credentials
+        if not args.target or Credentials().ssh(args.target, args.port) is None:
+            parser.error("first password login requires an interactive terminal")
     client = None
-    if not args.no_sync and (args.action in ("add", "sync") or config.get("SUBLINKPRO_URL")
+    if not args.no_sync and (args.action == "add" or config.get("SUBLINKPRO_URL")
                              or config.get("SUBLINKPRO_API_KEY")):
         client = SublinkPro(config, create_local_node=args.create_local_node)
     singbox = SingBox(config) if client and client.create_local_node else None
@@ -1043,7 +1295,14 @@ def run_workflow(args, parser, wizard, checkpoint=None, resume_sync=False):
         return
     if client:
         args.create_local_node = client.create_local_node
-        configure_resource_names(args, config, checkpoint, sys.stdin.isatty())
+        existing = configure_resource_names(args, config, checkpoint, sys.stdin.isatty())
+        if args.residential is None and (not existing or wizard):
+            current = False
+            if existing and sys.stdin.isatty():
+                nodes = client.remote_nodes(*existing)
+                current = bool(nodes) and all(RESIDENTIAL_TAG in client.node_tags(node["ID"]) for node in nodes)
+            args.residential = prompt_yes_no("此配置的节点是否为家宽", current) if sys.stdin.isatty() else False
+            checkpoint.capture(residential=args.residential)
     for option, key in ((args.mode, "OKP_MODE"), (args.domain, "OKP_FQDN"), (args.name, "OKP_NODE_NAME")):
         if option is not None:
             if any(ord(char) < 32 or ord(char) == 127 for char in option):
@@ -1057,6 +1316,8 @@ def run_workflow(args, parser, wizard, checkpoint=None, resume_sync=False):
                                        insecure=bool(args.insecure_subscription), selected=args.subscription_node,
                                        interactive=sys.stdin.isatty(), prompt=prompt_text, on_input=checkpoint.capture)
         if checkpoint.data["installation_id"] and checkpoint.data["installation_id"] != exported["INSTALLATION_ID"]:
+            if sys.stdin.isatty():
+                raise DeployError("订阅地址与恢复记录不同，请返回“添加配置”，选择“重新开始”。")
             raise DeployError("订阅地址与恢复记录不同，请使用 --fresh 开始新流程。")
         checkpoint.phase("sync", exported["INSTALLATION_ID"])
         apply_configuration(args, client, singbox, exported, checkpoint,
@@ -1085,6 +1346,8 @@ def run_workflow(args, parser, wizard, checkpoint=None, resume_sync=False):
                 install(ssh, config)
             exported = export_node(ssh)
             if expected_identity and exported["INSTALLATION_ID"].lower() != expected_identity.lower():
+                if sys.stdin.isatty():
+                    raise DeployError("VPS 安装标识与恢复记录不同，请先核实主机，再从原配置菜单选择“重新开始”。")
                 raise DeployError("VPS 安装标识与恢复记录不同。请核实主机，或用 --fresh 开始新流程。")
             checkpoint.phase("sync", exported["INSTALLATION_ID"])
             checkpoint.capture(mode=exported["MODE"])
@@ -1099,9 +1362,36 @@ def run_workflow(args, parser, wizard, checkpoint=None, resume_sync=False):
 def apply_configuration(args, client, singbox, exported, checkpoint, target, *, kind="deployment"):
     registry = ManagedDeployments(checkpoint)
     identity = exported["INSTALLATION_ID"].lower()
+    dependents = any(r["remote_relay"] and identity in (r["remote_relay"]["entry_id"], r["remote_relay"]["exit_id"], r["remote_relay"]["pending_exit_id"])
+                     for r in registry.records.values())
+    connection_changed = kind == "subscription" or identity not in registry.records
+    if identity in registry.records:
+        manager = NodeManager(client, registry)
+        journal = manager.pending(identity)
+        if journal and (all(op["role"] == "tag" for op in journal["operations"]) or journal["names"]):
+            changed = [key for key in args.supplied_fields & journal["intent"].keys()
+                       if key not in ("action", "target", "env_file", "source")
+                       and getattr(args, key, None) != journal["intent"][key]]
+            if changed:
+                raise DeployError("请先完成原来的家宽标签变更，再提交新参数。" + checkpoint.recovery_hint())
+            manager.apply(journal)
+            print("关联名称变更已完成。" if journal["names"] else "家宽标签变更已完成。")
+            return
+        if dependents and kind != "subscription":
+            exported_fingerprint = parse_node_link(exported["VLESS_URI"]).fingerprint
+            connection_changed = not any(parse_node_link(node["Link"]).fingerprint == exported_fingerprint
+                                         for node in client.remote_nodes(identity, registry.records[identity]))
+        if dependents and args.name is not None and registry.records[identity]["node_name"] != args.name:
+            manager.prepare_names(identity, args.name, [], client.all_nodes())
     registry.register(identity, target, args.env_file, client.url, exported["NODE_NAME"])
     if kind == "subscription":
         registry.update(identity, kind=kind)
+    else:
+        registry.update(identity, ssh={"target": target, "port": args.port,
+                                      "identity": str(Path(args.identity).expanduser().absolute()) if args.identity else None,
+                                      "password": args.password},
+                        server={"backend": "project", "identity": identity,
+                                "fingerprint": parse_node_link(exported["VLESS_URI"]).fingerprint})
     if args.relay is not None:
         relay_id = registry.select(args.relay) if args.relay else None
         registry.validate_relay(identity, relay_id)
@@ -1109,24 +1399,63 @@ def apply_configuration(args, client, singbox, exported, checkpoint, target, *, 
         checkpoint.capture(relay=relay_id or "")
     print(client.sync(exported, airport_name=args.airport_name, node_name=args.name, local_port=args.local_port,
                       interactive=sys.stdin.isatty(), on_input=checkpoint.capture,
-                      registry=registry, singbox=singbox, relay_requested=args.relay is not None))
+                      registry=registry, singbox=singbox, relay_requested=args.relay is not None, residential=args.residential))
+    if args.residential is not None and registry.records[identity]["airport_id"]:
+        deadline = time.monotonic() + 25
+        while args.residential and not client.remote_nodes(identity, registry.records[identity]):
+            if time.monotonic() >= deadline:
+                raise DeployError("机场节点尚未拉取，家宽标签未完成；请稍后继续此配置。")
+            time.sleep(.5)
+        manager = NodeManager(client, registry)
+        manager.apply(manager.prepare_residential(identity, args.residential, intent=copy.deepcopy(checkpoint.data["options"])))
     registry.update(identity, status="active")
+    if args.residential is not None:
+        registry.update(identity, residential=args.residential)
+    manager = NodeManager(client, registry)
+    names = manager.prepare_related_names(identity, intent=copy.deepcopy(checkpoint.data["options"]))
+    if names:
+        manager.apply(names)
+    if dependents and connection_changed:
+        sync_dependents(client, registry, read_env(args.env_file), identity)
 
 
-def node_edit_options(record):
-    print(f"\n编辑独立节点：{record['node_name']}\n  1. 修改名称\n  2. 更换远端节点链接"
-          "\n  3. 启用 / 修改本地节点\n  4. 关闭本地节点\n  5. 修改本地出站链接\n  0. 返回")
+def node_edit_options(record, client, residential=False):
+    print(f"\n编辑配置：{record['node_name']}\n  1. 修改名称\n  2. 设置节点来源"
+          "\n  3. 启用 / 修改本地节点\n  4. 关闭本地节点\n  5. 修改本地出站链接\n  6. 设置是否为家宽"
+          "\n  7. 设置 SSH 连接\n  8. 设置 3x-ui 管理")
+    if record["airport_id"]:
+        print("  9. 修改机场名称")
+    print("  0. 返回")
     while True:
         choice = prompt_text("请选择", "0")
         if choice == "0":
             return None
         if choice == "1":
             return {"name": prompt_text("节点名称", record["node_name"], required=True)}
+        if choice == "6":
+            return {"residential": prompt_yes_no("该节点是否为家宽", residential)}
+        if choice in ("7", "8"):
+            return {"part": "ssh" if choice == "7" else "server"}
+        if choice == "9" and record["airport_id"]:
+            return {"airport_name": prompt_text("机场名称", record["airport_name"], required=True)}
         if choice == "2":
+            if record["airport_id"]:
+                return {"part": "source"}
+            if not has_source(record):
+                source = prompt_text("节点来源（1=单条节点链接，2=订阅地址，3=3x-ui 服务器）", "1")
+                if source == "2":
+                    return {"part": "source", "source_type": "subscription"}
+                if source == "3":
+                    return {"part": "server"}
+                if source != "1":
+                    raise DeployError("节点来源选项无效。")
             return {"node_link": prompt_text("新的远端节点链接", required=True)}
         if choice == "3":
-            value = prompt_text("本地 Shadowsocks 端口", str(record["local_port"]) if record["local_port"] else None, required=True)
-            return {"create_local_node": True, "local_port": SublinkPro.local_port(value)}
+            values = {"create_local_node": True,
+                      "local_port": client.choose_local_port(default=record["local_port"], interactive=True, prompt=True)}
+            if not has_source(record) and record["local_source"] != "custom":
+                values["local_link"] = prompt_text("独立本地出站链接", required=True)
+            return values
         if choice == "4":
             return {"create_local_node": False}
         if choice == "5":
@@ -1139,7 +1468,7 @@ def node_edit_options(record):
 
 
 def run_node_workflow(args, config, checkpoint, wizard):
-    if args.no_sync or args.airport_name is not None or args.subscription_url or args.password or args.identity or args.port:
+    if args.no_sync or args.subscription_url or args.password or args.identity or args.port:
         raise DeployError("独立节点不使用机场名称、订阅地址或 SSH 参数。")
     interactive = sys.stdin.isatty()
     registry = ManagedDeployments(checkpoint)
@@ -1153,8 +1482,6 @@ def run_node_workflow(args, config, checkpoint, wizard):
     identity = checkpoint.data["installation_id"]
     if args.action == "edit":
         identity = identity or registry.select(args.target)
-        if not is_standalone(registry.records[identity]):
-            raise DeployError("edit 用于独立节点；机场通过添加配置更新。")
     record = registry.records.get(identity) if identity else None
     journal = manager.pending(identity) if record else None
     if journal:
@@ -1163,24 +1490,45 @@ def run_node_workflow(args, config, checkpoint, wizard):
                    if key not in ("action", "target", "env_file", "source") and getattr(args, key, None) != intent[key]]
         if changed:
             checkpoint.capture(**intent)
-            raise DeployError("此节点有未完成事务；请先用 --resume 完成原操作，再提交新参数。")
+            raise DeployError("此节点有未完成事务，请先完成原操作，再提交新参数。" + checkpoint.recovery_hint())
         if journal["box"]:
             manager.box = SingBox(config)
         checkpoint.phase("sync", identity)
         print("继续上次未完成的节点变更。")
         manager.apply(journal)
-        print("独立节点配置已完成。")
+        if journal.get("intent", {}).get("node_link"):
+            sync_dependents(client, registry, config, identity)
+        print("配置变更已完成。")
         return
     if args.action == "edit" and not record:
         raise DeployError("未找到要编辑的配置。")
-    edit_keys = ("name", "node_link", "local_port", "create_local_node", "local_link", "same_local", "relay")
-    if args.action == "edit" and (wizard or not any(getattr(args, key, None) is not None for key in edit_keys)):
+    edit_keys = ("name", "node_link", "local_port", "create_local_node", "local_link", "same_local", "relay", "residential", "part", "airport_name")
+    if args.action == "edit" and ((wizard and not args.resume) or
+                                    not any(getattr(args, key, None) is not None for key in edit_keys)):
         if not interactive:
             raise DeployError("请提供要编辑的名称、链接、本地节点或中转参数。")
-        changes = node_edit_options(record)
+        changes = node_edit_options(record, client, record["residential"])
         if changes is None:
             return
         remember(**changes)
+    if args.action == "edit" and args.part:
+        from deploy_parts import edit_part
+        checkpoint.complete()
+        edit_part(registry, identity, client, args, args.part)
+        checkpoint.start("edit", args.env_file)
+        return
+    if args.action == "edit" and not has_source(record) and not record["local_node_id"] and not record["singbox"] and not any(
+            getattr(args, key, None) is not None for key in edit_keys if key not in ("name", "residential")):
+        registry.update(identity, node_name=args.name or record["node_name"],
+                        residential=args.residential if args.residential is not None else record["residential"])
+        return
+    tags_only = args.action == "edit" and args.residential is not None and not any(
+        getattr(args, key, None) is not None for key in edit_keys if key != "residential")
+    if tags_only:
+        checkpoint.phase("sync", identity)
+        manager.apply(manager.prepare_residential(identity, args.residential, intent=copy.deepcopy(checkpoint.data["options"])))
+        print(f"{record['node_name']}：家宽标签已{'添加' if args.residential else '移除'}。")
+        return
     source = parse_node_link(args.node_link) if args.node_link else None
     if args.action == "add" and not record:
         if source is None:
@@ -1213,6 +1561,8 @@ def run_node_workflow(args, config, checkpoint, wizard):
         remember(name=client.custom_name(value, "", "节点名称", False))
     elif args.name is not None:
         remember(name=client.custom_name(args.name, "", "节点名称", False))
+    if args.residential is None and not record:
+        remember(residential=prompt_yes_no("该节点是否为家宽", False) if interactive else False)
     enabled = bool(record and (record["singbox"] or record["local_node_id"]))
     if args.local_port is not None or args.local_link is not None or args.same_local:
         remember(create_local_node=True)
@@ -1229,10 +1579,13 @@ def run_node_workflow(args, config, checkpoint, wizard):
                 raise DeployError("已取消关闭本地节点。")
     else:
         local_action = "enable" if args.create_local_node is True or (args.create_local_node is None and enabled) else "keep"
+    if args.action == "edit" and args.name is not None and not any(
+            getattr(args, key, None) is not None for key in edit_keys if key != "name"):
+        local_action = "keep"
     if local_action == "enable":
         manager.box = SingBox(config)
         if args.local_port is None:
-            remember(local_port=client.local_port(None, record["local_port"] if record else None, interactive))
+            remember(local_port=client.choose_local_port(default=record["local_port"] if record else None, interactive=interactive))
         if not record and interactive and args.local_link is None and args.same_local is None:
             while True:
                 choice = prompt_text("本地出站（1=跟随远端节点，2=独立链接）", "1")
@@ -1268,9 +1621,23 @@ def run_node_workflow(args, config, checkpoint, wizard):
     journal = manager.prepare(identity, link=args.node_link, name=args.name, local_action=local_action,
                               local_port=args.local_port if local_action == "enable" else None,
                               local_link=args.local_link, same_local=bool(args.same_local), relay_id=relay_id,
-                              adopt_id=args.adopt_node, intent=copy.deepcopy(checkpoint.data["options"]))
+                              adopt_id=args.adopt_node, intent=copy.deepcopy(checkpoint.data["options"]), residential=args.residential,
+                              airport_name=args.airport_name)
     record = manager.apply(journal)
+    if args.node_link is not None:
+        sync_dependents(client, registry, config, identity)
     print(f"独立节点已配置：{record['node_name']}；本地端口：{record['local_port'] or '未启用'}。")
+
+
+def local_relay_description(record, registry, direct="直连"):
+    if record["status"] == "relaying":
+        return (f"待经由 {registry.records[record['relay_id']]['node_name']} 中转"
+                if record["relay_id"] else "待取消中转")
+    return registry.records[record["relay_id"]]["node_name"] if record["relay_id"] else direct
+
+
+def configuration_status(record):
+    return "relaying（中转变更未完成）" if record["status"] == "relaying" else record["status"]
 
 
 def manage_deployments(args, env_override=False):
@@ -1285,9 +1652,12 @@ def manage_deployments(args, env_override=False):
         if not registry.records:
             print("暂无受管配置；安装或添加成功后会保留资源清单。")
         for identity, record in registry.records.items():
-            relay = registry.records[record["relay_id"]]["node_name"] if record["relay_id"] else "直连"
-            kind = "独立节点" if is_standalone(record) else "机场订阅"
-            print(f"{identity}  {configuration_label(record)}  [{kind}, {record['status']}]  中转: {relay}")
+            relay = local_relay_description(record, registry)
+            kind = "远程中转" if is_remote_relay(record) else "独立节点" if is_standalone(record) else "机场订阅"
+            if is_remote_relay(record):
+                source = record["remote_relay"]
+                relay = registry.records[source["entry_id"]]["node_name"] + " → " + registry.records[source["exit_id"]]["node_name"]
+            print(f"{identity}  {configuration_label(record)}  [{kind}, {configuration_status(record)}]  中转: {relay}")
         return
     if not sys.stdin.isatty():
         raise DeployError("删除操作需要交互终端，以确认要删除的部署。")
@@ -1321,6 +1691,8 @@ def manage_deployments(args, env_override=False):
             raise DeployError("SublinkPro 地址与受管记录不同，拒绝删除。")
         if is_standalone(record) and NodeManager(client, registry).pending(identity):
             raise DeployError("此节点有未完成变更，请先进入该配置继续节点变更。")
+        remote_manager = RemoteRelayManager(client, registry, config) if is_remote_relay(record) else None
+        remote_creation = remote_manager.creation_for(identity) if remote_manager else None
         singbox = SingBox(config) if record["singbox"] else None
         plan = singbox.plan(identity, metadata=record["singbox"], remove=True) if singbox else None
         airport, node = client.deletion_candidates(identity, record)
@@ -1332,18 +1704,28 @@ def manage_deployments(args, env_override=False):
             print(f"将清理已接管的手工远端节点：{record['remote_node_id']}")
         if plan:
             print(f"sing-box：{plan.metadata['inbound_tag']} -> {plan.metadata['outbound_tag']}")
+        if remote_manager:
+            print("将连接入口 VPS，删除此中转的专属账号、出站和路由；保留原入口及落地。")
         if record["status"] != "deleting" and not prompt_yes_no("确认删除上述受管资源", False):
             return
         registry.update(identity, status="deleting")
+        if remote_manager:
+            remote_manager.delete_remote(identity)
         if plan:
             registry.update(identity, singbox=plan.metadata)
             registry.update(identity, singbox=singbox.commit(plan))
         client.remove_deployment(identity, record, lambda **values: registry.update(identity, **values))
+        if remote_creation:
+            remote_creation.complete()
         registry.forget(identity)
+        ResumeState(node_id=identity).path.unlink(missing_ok=True)
+        if remote_manager:
+            remote_manager.pending_path(identity).unlink(missing_ok=True)
         pending = checkpoint.load()
         if pending and pending["installation_id"] and pending["installation_id"].lower() == identity:
             checkpoint.complete()
-        print("已删除对应的 sing-box 和 SublinkPro 资源；未连接或卸载 VPS。")
+        print("已清理远程中转及对应本地 / SublinkPro 资源；原入口及落地保留。" if remote_manager
+              else "已删除对应的 sing-box 和 SublinkPro 资源；未连接或卸载 VPS。")
 
 
 def view_configurations(args, env_override=False):
@@ -1355,9 +1737,12 @@ def view_configurations(args, env_override=False):
             return
         for index, key in enumerate(entries, 1):
             record = registry.records[key]
-            relay = registry.records[record["relay_id"]]["node_name"] if record["relay_id"] else "否"
-            kind = "独立节点" if is_standalone(record) else "机场订阅"
-            print(f"  {index}. {configuration_label(record)} [{kind}, {record['status']}]  中转：{relay}")
+            relay = local_relay_description(record, registry, "否")
+            kind = "远程中转" if is_remote_relay(record) else "独立节点" if is_standalone(record) else "机场订阅"
+            if is_remote_relay(record):
+                source = record["remote_relay"]
+                relay = registry.records[source["entry_id"]]["node_name"] + " → " + registry.records[source["exit_id"]]["node_name"]
+            print(f"  {index}. {configuration_label(record)} [{kind}, {configuration_status(record)}]  中转：{relay}")
         value = prompt_text("选择配置（0 返回）", "0")
         if value == "0":
             return
@@ -1369,12 +1754,16 @@ def view_configurations(args, env_override=False):
             record = registry.records.get(identity)
             if not record:
                 break
-            relay = registry.records[record["relay_id"]]["node_name"] if record["relay_id"] else "否（直连）"
-            kind = "独立节点" if is_standalone(record) else "机场订阅"
+            relay = local_relay_description(record, registry, "否（直连）")
+            kind = "远程中转" if is_remote_relay(record) else "独立节点" if is_standalone(record) else "机场订阅"
             print(f"\n类型：{kind}")
+            if is_remote_relay(record):
+                source = record["remote_relay"]
+                print(f"入口：{registry.records[source['entry_id']]['node_name']}\n落地：{registry.records[source['exit_id']]['node_name']}")
+                relay = "服务器端中转"
             if not is_standalone(record):
                 print(f"机场：{record['airport_name']}\nSublinkPro 机场 ID：{record['airport_id'] or '-'}")
-            print(f"节点：{record['node_name']}\n状态：{record['status']}"
+            print(f"节点：{record['node_name']}\n状态：{configuration_status(record)}"
                   f"\n来源：{record['target']}\n管理 ID：{identity}"
                   f"\nSublinkPro 远端节点 ID：{record['remote_node_id'] or '-'}"
                   f"\nSublinkPro 本地节点 ID：{record['local_node_id'] or '-'}"
@@ -1383,24 +1772,45 @@ def view_configurations(args, env_override=False):
             if record["singbox"]:
                 print(f"sing-box：{record['singbox']['inbound_tag']} -> {record['singbox']['outbound_tag']}")
                 print("本地出站：" + ("独立配置" if record["local_source"] == "custom" else "跟随远端节点"))
+            for part_name, status in parts(record).items():
+                print(part_name + "：" + status)
+            pending_parts = [label for part, label in (("ssh", "SSH 连接"), ("server", "3x-ui 管理"), ("source", "节点来源"), ("local", "本地节点"))
+                             if (registry.state.directory / ("part-" + part + "-" + identity + ".json")).exists()]
+            if pending_parts:
+                print("待继续补全：" + "、".join(pending_parts))
             print("  1. 中转设置\n  2. 删除此配置")
-            if is_standalone(record):
-                print("  3. 继续节点变更" if record["status"] == "updating" else "  3. 编辑此节点")
+            if is_remote_relay(record):
+                print("  3. 同步 / 继续远程中转变更")
+            elif is_standalone(record):
+                print("  3. 继续节点变更" if record["status"] == "updating" else "  3. 编辑配置")
+            else:
+                print("  3. 继续节点变更" if record["status"] == "updating" else "  3. 编辑配置")
+            if record['server'] or is_remote_relay(record):
+                print("  4. 诊断面板")
             print("  0. 返回")
             value = prompt_text("请选择", "0")
             if value == "0":
                 break
             selected = argparse.Namespace(**(vars(args) | {"target": identity, "relay": None}))
             if value == "1":
-                manage_relay(selected, env_override)
+                if is_remote_relay(record):
+                    manage_remote(selected, env_override)
+                else:
+                    manage_relay(selected, env_override)
             elif value == "2":
                 selected.action = "remove"
                 manage_deployments(selected, env_override)
-            elif value == "3" and is_standalone(record):
+            elif value == "3" and is_remote_relay(record):
+                selected.action = "remote-sync"
+                manage_remote(selected, env_override)
+            elif value == "3" and not is_remote_relay(record):
                 options = ["edit", identity]
                 if env_override:
                     options += ["--env-file", str(args.env_file)]
                 main(options)
+            elif value == '4' and (record['server'] or is_remote_relay(record)):
+                from deploy_panels import inspect_panel
+                inspect_panel(selected, env_override)
 
 
 def manage_relay(args, env_override=False):
@@ -1423,8 +1833,21 @@ def manage_relay(args, env_override=False):
                     identity = entries[int(choice) - 1]
                     break
         record = registry.records[identity]
+        if is_remote_relay(record):
+            if args.relay is not None:
+                raise DeployError("组合节点不能设置客户端 detour；请使用远程中转设置。")
+            return manage_remote(args, env_override, registry=registry)
         if record["status"] not in ("active", "relaying"):
             raise DeployError("请先完成该节点的安装、同步、接管或删除流程。")
+        if args.relay is None and record["status"] == "active" and sys.stdin.isatty():
+            print("  1. 本地中转\n  2. 远程中转\n  0. 返回")
+            choice = prompt_text("请选择", "0")
+            if choice == "0":
+                return
+            if choice == "2":
+                return manage_remote(args, env_override, registry=registry, exit_id=identity)
+            if choice != "1":
+                raise DeployError("中转类型无效。")
         if args.relay is None and record["status"] == "relaying":
             relay_id = record["relay_id"]
             print("继续上次未完成的中转设置。")
@@ -1451,10 +1874,17 @@ def manage_relay(args, env_override=False):
         client = SublinkPro(config, create_local_node=False)
         if client.url != record["sublink_url"]:
             raise DeployError("SublinkPro 实例与记录不匹配。")
+        if relay_id:
+            from deploy_parts import require_source, require_local
+            if not require_source(registry, identity, client, args) or not require_source(registry, relay_id, client, args):
+                return
+            if record["singbox"] and not require_local(registry, relay_id, client, config):
+                return
         if is_standalone(record) and NodeManager(client, registry).pending(identity):
             raise DeployError("此节点有未完成变更，请先继续原操作。")
         parent = registry.records[relay_id] if relay_id else None
         relay_node = client.relay_node(relay_id, parent) if parent else None
+        client.prepare_relay(identity, record, relay_node)
         box = SingBox(config) if record["singbox"] else None
         if box and parent and not parent["singbox"]:
             raise DeployError("中转节点没有 sing-box 出站。")
@@ -1474,9 +1904,13 @@ def manage_relay(args, env_override=False):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__, argument_default=argparse.SUPPRESS)
-    parser.add_argument("action", nargs="?", choices=("install", "add", "sync", "edit", "check", "list", "remove", "relay", "adopt"), default=None)
+    parser.add_argument("action", nargs="?", choices=("install", "add", "edit", "check", "list", "remove", "relay", "adopt", "remote-relay", "remote-sync", "update-panels", "inspect-panel"), default=None)
     parser.add_argument("target", nargs="?", help="SSH target, subscription URL for add, or managed ID/name", default=None)
     parser.add_argument("--subscription-url", help="add a subscription without SSH")
+    parser.add_argument("--partial", action="store_true", help="add a named configuration and fill optional parts later")
+    parser.add_argument("--part", choices=("ssh", "server", "source"), help="edit or complete one configuration part")
+    parser.add_argument("--ssh-target", help="SSH host or alias when completing an existing configuration")
+    parser.add_argument("--source-type", choices=("link", "subscription"), help="source type when filling an unset source part")
     node_input = parser.add_mutually_exclusive_group()
     node_input.add_argument("--node-link", help="standalone VLESS, Shadowsocks or SOCKS5 link")
     node_input.add_argument("--node-file", type=Path, help="read a node link from a private 0600 file")
@@ -1485,6 +1919,8 @@ def main(argv=None):
     local_input.add_argument("--same-local", action="store_true", help="make the local outbound follow the remote node")
     parser.add_argument("--adopt-node", type=int, help="explicitly adopt an existing manual SublinkPro node ID")
     parser.add_argument("--subscription-node", help="local outbound selection: 1-based node index or saved fingerprint")
+    parser.add_argument("--entry", help="managed VPS entry for a new remote relay")
+    parser.add_argument("--exit-node", help="replace a remote relay's managed exit source")
     parser.add_argument("--insecure-subscription", action="store_true", help="allow a self-signed subscription certificate")
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--port", type=int, help="SSH port")
@@ -1497,12 +1933,15 @@ def main(argv=None):
     parser.add_argument("--airport-name", help="SublinkPro airport name; prompted before deployment on first import")
     parser.add_argument("--node-name", "--name", dest="name",
                         help="node name for the installer and airport node renaming rule")
-    parser.add_argument("--local-port", type=int, help="Surge device's local Shadowsocks port (1-65535)")
+    parser.add_argument("--local-port", type=int, help="local Shadowsocks port (1-65535); omitted ports reuse the existing port or select a free one")
     local_group = parser.add_mutually_exclusive_group()
     local_group.add_argument("--local-node", dest="create_local_node", action="store_true",
                              help="configure the local node in both sing-box and SublinkPro")
     local_group.add_argument("--no-local-node", dest="create_local_node", action="store_false",
                              help="add: keep existing local resources; edit: remove local resources after confirmation")
+    residential_group = parser.add_mutually_exclusive_group()
+    residential_group.add_argument("--residential", dest="residential", action="store_true", help="add the residential tag")
+    residential_group.add_argument("--no-residential", dest="residential", action="store_false", help="remove the residential tag")
     parser.add_argument("--interactive", action="store_true", help="prompt for deployment options")
     parser.add_argument("--no-sync", action="store_true", help="install without SublinkPro sync")
     relay_group = parser.add_mutually_exclusive_group()
@@ -1517,8 +1956,6 @@ def main(argv=None):
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
             supplied["node_link"] = stream.read(4097).strip()
         parse_node_link(supplied["node_link"])
-    if supplied.get("action") == "sync":
-        supplied["action"] = "add"
     if (supplied.get("action") == "add" and "://" in supplied.get("target", "")
             and not supplied["target"].startswith(("https://", "http://"))):
         if "node_link" in supplied:
@@ -1536,6 +1973,12 @@ def main(argv=None):
         supplied["source"] = "subscription"
         if not supplied.get("resume"):
             supplied["action"] = "add"
+    if supplied.get("partial"):
+        if supplied.get("action") not in (None, "add") or any(supplied.get(k) for k in ("target", "node_link", "subscription_url")):
+            parser.error("--partial is for adding a configuration without a source")
+        if supplied.get("create_local_node") or supplied.get("local_port") or supplied.get("local_link") or supplied.get("same_local"):
+            parser.error("--partial saves basic information; complete local nodes through edit")
+        supplied.update(action="add", source="partial")
     if "node_link" in supplied or supplied.get("action") == "edit":
         if supplied.get("action") not in (None, "add", "edit") or (supplied.get("target") and supplied.get("action") != "edit"):
             parser.error("node links are for add/edit and cannot use an SSH target")
@@ -1546,18 +1989,21 @@ def main(argv=None):
                     mode=None, domain=None, airport_name=None, name=None, local_port=None, create_local_node=None,
                     interactive=False, no_sync=False, resume=False, fresh=False, auth_method=None, relay=None,
                     source=None, subscription_url=None, insecure_subscription=None, subscription_node=None,
-                    node_link=None, local_link=None, same_local=None, adopt_node=None)
+                    node_link=None, local_link=None, same_local=None, adopt_node=None, entry=None, exit_node=None, residential=None,
+                    part=None, partial=False, ssh_target=None, source_type=None)
     args = argparse.Namespace(**(defaults | supplied))
     args.supplied_fields = set(supplied)
     args.env_override = "env_file" in supplied
     wizard = args.interactive or (args.action is None and not args.resume) or (
-        args.action in ("install", "add") and not args.target and not args.subscription_url and not args.node_link and not args.resume)
+        args.action in ("install", "add") and not args.target and not args.subscription_url and not args.node_link and not args.resume and not args.partial)
     if wizard and not sys.stdin.isatty():
         parser.error("interactive mode requires a terminal; supply an action and SSH target")
     if supplied.get("local_port") is not None and supplied.get("create_local_node") is False:
         parser.error("--local-port cannot be used with --no-local-node")
     if supplied.get("create_local_node") is False and (args.local_link is not None or args.same_local):
         parser.error("local outbound options require local nodes")
+    if args.residential is not None and args.no_sync:
+        parser.error("residential tags require SublinkPro sync")
     if args.action == "edit" and not args.target and not args.resume:
         parser.error("edit requires a managed configuration ID or name")
     if args.action is None and not args.resume:
@@ -1577,6 +2023,52 @@ def main(argv=None):
         from deploy_adopt import adopt_manifest
         adopt_manifest(read_env(args.env_file), Path(args.env_file).expanduser().absolute(), Path(args.target), ResumeState())
         return
+    if args.part:
+        if args.action == 'update-panels':
+            parser.error('--part is not supported by update-panels')
+        if args.action != "edit" or not args.target:
+            parser.error("--part requires edit and a configuration ID/name")
+        if args.source_type and args.part != "source":
+            parser.error("--source-type requires --part source")
+        from deploy_parts import edit_part
+        with ResumeState().locked() as state:
+            registry = ManagedDeployments(state)
+            identity = registry.select(args.target)
+            record = registry.records[identity]
+            if is_remote_relay(record) or record["status"] == "deleting":
+                raise DeployError("请编辑原始配置的部分，或先完成删除操作。")
+            config = read_env(args.env_file if args.env_override else record["env_file"])
+            client = SublinkPro(config, create_local_node=False)
+            edit_part(registry, identity, client, args, args.part)
+        return
+    if args.ssh_target:
+        parser.error("--ssh-target requires --part")
+    if args.action == 'inspect-panel':
+        if args.resume or args.fresh or not args.target:
+            parser.error('inspect-panel requires a configuration ID/name and cannot use --resume or --fresh')
+        from deploy_panels import inspect_panel
+        inspect_panel(args, args.env_override)
+        return
+    if args.action == 'update-panels':
+        if args.resume or args.fresh or args.target:
+            parser.error('update-panels uses the panel selection menu and cannot use a target, --resume or --fresh')
+        from deploy_panels import manage_panels
+        manage_panels(args)
+        return
+    if args.source_type:
+        parser.error("--source-type requires --part source")
+    editing_remote = False
+    if args.action == "edit" and args.target:
+        registry = ManagedDeployments(ResumeState())
+        editing_remote = is_remote_relay(registry.records[registry.select(args.target)])
+    if args.action in ("remote-relay", "remote-sync") or editing_remote:
+        if (args.resume or args.fresh or args.no_sync or args.relay is not None or args.local_link is not None
+                or args.same_local or args.airport_name is not None or args.node_link is not None or args.adopt_node is not None):
+            parser.error("remote relay operations use their own saved transactions and cannot use local relay/source options")
+        manage_remote(args, "env_file" in supplied)
+        return
+    if args.entry is not None or args.exit_node is not None:
+        parser.error("--entry/--exit-node require a remote relay operation")
     if args.action == "relay":
         if args.resume or args.fresh:
             parser.error("repeat relay directly to retry")
@@ -1597,29 +2089,53 @@ def main(argv=None):
         return
     checkpoint = ResumeState()
     with checkpoint.locked():
-        pending = None if args.fresh else checkpoint.load()
-        if pending and wizard and not args.resume:
-            choice = choose_pending(pending)
+        checkpoint = workflow_checkpoint(args, supplied, checkpoint)
+        try:
+            pending = checkpoint.load()
+        except DeployError:
+            if not args.fresh:
+                raise
+            pending = None
+        can_restart = checkpoint_can_restart(checkpoint, pending) if pending else True
+        if args.fresh and checkpoint.node_id:
+            can_restart = checkpoint_can_restart(checkpoint, {"installation_id": checkpoint.node_id,
+                                                   "options": {"action": "edit"}})
+        if args.fresh and not can_restart:
+            raise DeployError("此节点已有开始写入的变更，请先继续原操作。" + checkpoint.recovery_hint())
+        if pending and not args.fresh and (wizard or (args.action == "edit" and sys.stdin.isatty())) and not args.resume:
+            choice = choose_pending(pending, can_restart=can_restart)
             if choice == "0":
                 return
             if choice == "2":
                 args.fresh = True
-                pending = None
             else:
-                args.action = None
-                supplied.pop("action", None)
+                for key in RESUME_TYPES:
+                    supplied.pop(key, None)
+                vars(args).update(defaults)
+                args.resume = True
+                args.supplied_fields = set(supplied)
+                args.env_override = False
+        if args.fresh:
+            if pending and pending["options"]["action"] == "add" and pending["options"].get("source") == "node":
+                registry = ManagedDeployments(checkpoint)
+                identity = pending["installation_id"]
+                if identity in registry.records and registry.records[identity]["status"] == "syncing":
+                    registry.forget(identity)
+            pending = None
         if args.resume and not pending:
             raise DeployError("没有未完成的流程可恢复。")
         if pending and not args.fresh:
             previous = pending["options"]
             same_target = args.target is None or previous.get("target") is None or args.target == previous["target"]
-            previous_action = "add" if previous["action"] == "sync" else previous["action"]
+            previous_action = previous["action"]
             same_action = args.action is None or args.action == previous_action or (
                 pending["phase"] == "sync" and "edit" not in (args.action, previous_action))
             same_env = "env_file" not in supplied or str(args.env_file.expanduser().absolute()) == previous["env_file"]
             same_source = "source" not in supplied or previous.get("source", "ssh") in (None, supplied["source"])
             same_url = "subscription_url" not in supplied or supplied["subscription_url"] == previous.get("subscription_url")
             if not (same_target and same_action and same_env and same_source and same_url):
+                if sys.stdin.isatty():
+                    raise DeployError("已有另一项未完成流程，请返回主菜单，进入安装 / 添加配置选择“继续上次”或“重新开始”。")
                 raise DeployError("已有另一项未完成流程。使用 --resume 继续，或 --fresh 开始新流程。")
             args.resume = True
             merged = previous | {key: value for key, value in supplied.items() if key in RESUME_TYPES}
@@ -1640,8 +2156,6 @@ def main(argv=None):
         if "local_port" in supplied:
             merged["create_local_node"] = True
         vars(args).update(merged)
-        if args.action == "sync":
-            args.action = "add"
         args.env_file = Path(args.env_file).expanduser().absolute()
         if args.action not in ("install", "add", "edit"):
             parser.error("install, add or edit is required")
@@ -1669,12 +2183,13 @@ def main(argv=None):
         try:
             run_workflow(args, parser, wizard, checkpoint, resume_sync)
         except (Exception, KeyboardInterrupt):
-            print("流程未完成，已保留输入；运行 python3 deploy.py --resume 可继续。", file=sys.stderr)
+            print("流程未完成，已保留输入；" + checkpoint.recovery_hint(), file=sys.stderr)
             raise
         checkpoint.complete()
 
 
 if __name__ == "__main__":
+    sys.modules.setdefault("deploy", sys.modules[__name__])
     try:
         main()
     except (DeployError, OSError, UnicodeError) as error:
@@ -1683,5 +2198,6 @@ if __name__ == "__main__":
                            else "Local file or process operation failed."), file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        print("已取消。运行 python3 deploy.py --resume 可继续未完成的流程。", file=sys.stderr)
+        print("已取消；未完成的流程仍可从对应菜单继续。" if sys.stdin.isatty() else
+              "已取消。运行 python3 deploy.py --resume 可继续未完成的流程。", file=sys.stderr)
         sys.exit(130)

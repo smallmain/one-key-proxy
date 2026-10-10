@@ -118,8 +118,6 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(after["route"]["final"], "direct")
         self.assertNotIn("old-in", [n["tag"] for n in after["inbounds"]])
         self.assertNotIn("old-out", [n["tag"] for n in after["outbounds"]])
-        self.assertEqual(next(n for n in after["outbounds"] if n["tag"] == "socks-Home-out")["detour"], "vless-US-out")
-        self.assertIn({"inbound": ["ss-Home-in"], "action": "route", "outbound": "socks-Home-out"}, after["route"]["rules"])
         self.assertEqual(after["inbounds"][-1], self.before["inbounds"][-1])
         for node in self.client.data:
             self.assertEqual(urllib.parse.urlsplit(node["Link"])._replace(fragment="").geturl(), original_links[node["ID"]])
@@ -127,6 +125,10 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(len(records), 3)
         self.assertTrue(all(r["kind"] == "adopted" and r["status"] == "active" for r in records.values()))
         by_name = {r["node_name"]: (key, r) for key, r in records.items()}
+        home_in, home_out = SingBox.tags(by_name["Home"][0])
+        us_out = SingBox.tags(by_name["US"][0])[1]
+        self.assertEqual(next(n for n in after["outbounds"] if n["tag"] == home_out)["detour"], us_out)
+        self.assertIn({"inbound": [home_in], "action": "route", "outbound": home_out}, after["route"]["rules"])
         self.assertEqual(by_name["Home"][1]["relay_id"], by_name["US"][0])
         self.assertEqual(by_name["Home"][1]["remote_node_id"], 501)
         self.assertIsNone(by_name["Home"][1]["airport_id"])

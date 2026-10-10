@@ -43,11 +43,20 @@ def atomic_write(path, content):
 
 
 def is_standalone(record):
-    return record.get("kind") == "node" or (record.get("airport_id") is None and record.get("remote_node_id") is not None)
+    return record.get("kind") in ("node", "remote-relay") or (record.get("airport_id") is None and record.get("remote_node_id") is not None)
 
 
 def configuration_label(record):
     return record["node_name"] if is_standalone(record) else f"{record['airport_name']} / {record['node_name']}"
+
+
+def remote_relay_name(entry, exit_node):
+    return exit_node["node_name"] + "(" + entry["node_name"] + "中转)"
+
+
+def remote_relay_record(entry_id, exit_id, fingerprint=None, *, auto_name=True):
+    return {"entry_id": entry_id, "exit_id": exit_id, "exit_fingerprint": fingerprint,
+            "pending_exit_id": None, "auto_name": auto_name}
 
 
 class ManagedDeployments:
@@ -68,38 +77,19 @@ class ManagedDeployments:
             if len(raw) > 2 * 1024 * 1024:
                 raise ValueError
             document = json.loads(raw)
-            if set(document) != {"version", "deployments"} or document["version"] != 1:
+            if set(document) != {"version", "deployments"} or document["version"] != 3:
                 raise ValueError
             self.records = document["deployments"]
-            self.migrate()
             self.validate()
         except (ValueError, TypeError, KeyError):
             raise DeployError("受管部署清单无效，请检查 .deploy-state/managed.json。") from None
-
-    def migrate(self):
-        if not isinstance(self.records, dict):
-            return
-        for record in self.records.values():
-            if not isinstance(record, dict):
-                continue
-            record.setdefault("kind", "deployment")
-            record.setdefault("remote_node_id", None)
-            record.setdefault("relay_id", None)
-            box = record.get("singbox") or {}
-            if not isinstance(box, dict):
-                raise ValueError("invalid sing-box metadata")
-            record.setdefault("local_source", "custom" if record["kind"] == "adopted" and
-                              box.get("outbound_tag", "").startswith("socks-") else "remote")
-            record.setdefault("remote_fingerprints", [])
-            if is_standalone(record):
-                record["airport_name"] = ""
 
     def validate(self):
         if not isinstance(self.records, dict):
             raise ValueError
         allowed = {"target", "env_file", "sublink_url", "airport_id", "local_node_id", "airport_name",
                    "node_name", "local_port", "singbox", "status", "kind", "remote_node_id", "relay_id",
-                   "remote_fingerprints", "local_source"}
+                   "remote_fingerprints", "local_source", "ssh", "server", "residential", "part_errors", "remote_relay"}
         for identity, record in self.records.items():
             if not re.fullmatch(r"[0-9a-f]{32}", identity) or not isinstance(record, dict) or set(record) != allowed:
                 raise ValueError
@@ -108,7 +98,7 @@ class ManagedDeployments:
                     raise ValueError
             if not Path(record["env_file"]).is_absolute() or not record["target"] or not record["sublink_url"]:
                 raise ValueError
-            if record["status"] not in ("syncing", "active", "deleting", "adopting", "relaying", "updating") or record["kind"] not in ("deployment", "adopted", "subscription", "node"):
+            if record["status"] not in ("syncing", "active", "deleting", "adopting", "relaying", "updating") or record["kind"] not in ("deployment", "adopted", "subscription", "node", "remote-relay"):
                 raise ValueError
             if (record["local_source"] not in ("remote", "custom") or not isinstance(record["remote_fingerprints"], list)
                     or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v) for v in record["remote_fingerprints"])):
@@ -120,39 +110,93 @@ class ManagedDeployments:
                     raise ValueError
             if record["singbox"] is not None:
                 SingBox.validate_metadata(identity, record["singbox"])
+            if record["ssh"] is not None:
+                self.validate_ssh(record["ssh"])
+            if type(record["residential"]) is not bool:
+                raise ValueError("invalid residential setting")
+            if (not isinstance(record["part_errors"], dict) or set(record["part_errors"]) - {"source", "local", "ssh", "server"}
+                    or any(not isinstance(v, str) or len(v) > 400 or any(ord(c) < 32 for c in v) for v in record["part_errors"].values())):
+                raise ValueError("invalid part diagnostics")
+            if record["server"] is not None:
+                server = record["server"]
+                if (not isinstance(server, dict) or set(server) != {"backend", "identity", "fingerprint"}
+                        or server["backend"] not in ("project", "standalone")
+                        or not re.fullmatch(r"[0-9a-f]{32}", server["identity"])
+                        or not re.fullmatch(r"[0-9a-f]{64}", server["fingerprint"]) or record["ssh"] is None):
+                    raise ValueError("invalid server management")
+            relay = record["remote_relay"]
+            if (record["kind"] == "remote-relay") != (relay is not None):
+                raise ValueError("invalid remote relay")
+            if relay is not None:
+                if (not isinstance(relay, dict) or set(relay) != {"entry_id", "exit_id", "exit_fingerprint", "pending_exit_id", "auto_name"}
+                        or type(relay["auto_name"]) is not bool
+                        or record["relay_id"] is not None or record["local_source"] != "remote"
+                        or any(not isinstance(relay[key], str) or not re.fullmatch(r"[0-9a-f]{32}", relay[key])
+                               for key in ("entry_id", "exit_id"))
+                        or (relay["exit_fingerprint"] is not None and not re.fullmatch(r"[0-9a-f]{64}", relay["exit_fingerprint"]))):
+                    raise ValueError("invalid remote relay")
+                if relay["pending_exit_id"] is not None and not re.fullmatch(r"[0-9a-f]{32}", relay["pending_exit_id"]):
+                    raise ValueError("invalid pending exit")
         if any(record["relay_id"] is not None and record["relay_id"] not in self.records for record in self.records.values()):
             raise ValueError("missing relay")
-        tuple(graphlib.TopologicalSorter({key: [r["relay_id"]] if r["relay_id"] else []
-                                         for key, r in self.records.items()}).static_order())
+        graph = self.graph()
+        if any(parent not in self.records for parents in graph.values() for parent in parents):
+            raise ValueError("missing remote relay dependency")
+        tuple(graphlib.TopologicalSorter(graph).static_order())
+
+    @staticmethod
+    def validate_ssh(ssh):
+        if (not isinstance(ssh, dict) or set(ssh) != {"target", "port", "identity", "password"}
+                or not isinstance(ssh["target"], str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.:@\[\]-]*", ssh["target"])
+                or (ssh["port"] is not None and (type(ssh["port"]) is not int or not 1 <= ssh["port"] <= 65535))
+                or (ssh["identity"] is not None and (not isinstance(ssh["identity"], str) or any(ord(c) < 32 for c in ssh["identity"])))
+                or type(ssh["password"]) is not bool):
+            raise ValueError("invalid SSH binding")
+
+    def graph(self):
+        return {key: ([r["relay_id"]] if r["relay_id"] else []) +
+                ([r["remote_relay"]["entry_id"], r["remote_relay"]["exit_id"]] +
+                 ([r["remote_relay"]["pending_exit_id"]] if r["remote_relay"].get("pending_exit_id") else [])
+                 if r.get("remote_relay") else [])
+                for key, r in self.records.items()}
 
     def save(self):
         try:
-            self.migrate()
             self.validate()
         except (ValueError, TypeError, KeyError):
             raise DeployError("受管部署清单包含无效数据，未保存。") from None
-        content = json.dumps({"version": 1, "deployments": self.records}, ensure_ascii=False, indent=2).encode() + b"\n"
+        content = json.dumps({"version": 3, "deployments": self.records}, ensure_ascii=False, indent=2).encode() + b"\n"
         atomic_write(self.path, content)
 
-    def register(self, identity, target, env_file, sublink_url, name):
+    def register(self, identity, target, env_file, sublink_url, name, *, kind="deployment", remote_relay=None):
         identity = identity.lower()
         existing = self.records.get(identity)
         if existing and (existing["sublink_url"] != sublink_url or existing["status"] in ("deleting", "adopting", "relaying", "updating")):
             raise DeployError("此部署已绑定其他 SublinkPro 地址或正在删除，拒绝重新登记。")
         if not existing:
             self.records[identity] = {"target": target, "env_file": str(env_file), "sublink_url": sublink_url,
-                                      "airport_id": None, "local_node_id": None, "airport_name": name,
+                                      "airport_id": None, "local_node_id": None,
+                                      "airport_name": "" if kind in ("node", "remote-relay") else name,
                                       "node_name": name, "local_port": None, "singbox": None, "status": "syncing",
-                                      "kind": "deployment", "remote_node_id": None, "relay_id": None}
+                                      "kind": kind, "remote_node_id": None, "relay_id": None,
+                                      "local_source": "remote", "remote_fingerprints": [], "ssh": None, "server": None,
+                                      "residential": False, "part_errors": {},
+                                      "remote_relay": copy.deepcopy(remote_relay)}
         self.update(identity, target=target, env_file=str(env_file), status="syncing")
 
     def update(self, identity, **values):
-        self.records[identity].update(copy.deepcopy(values))
+        self.update_many({identity: values})
+
+    def update_many(self, updates):
+        for identity, values in updates.items():
+            self.records[identity].update(copy.deepcopy(values))
         self.save()
 
     def forget(self, identity):
         del self.records[identity]
         self.save()
+        from deploy_credentials import Credentials
+        Credentials(self.state).forget_panel(identity)
 
     def select(self, value):
         matches = [identity for identity, record in self.records.items()
@@ -167,7 +211,7 @@ class ManagedDeployments:
                 raise DeployError("中转节点不存在或尚未完成配置。")
             if self.records[identity]["sublink_url"] != self.records[relay_id]["sublink_url"]:
                 raise DeployError("中转必须属于同一 SublinkPro 实例。")
-        graph = {key: ([record["relay_id"]] if record["relay_id"] else []) for key, record in self.records.items()}
+        graph = self.graph()
         graph[identity] = [relay_id] if relay_id else []
         try:
             tuple(graphlib.TopologicalSorter(graph).static_order())
@@ -175,7 +219,9 @@ class ManagedDeployments:
             raise DeployError("中转配置会形成循环或引用自身。") from None
 
     def dependents(self, identity):
-        return [record["node_name"] for record in self.records.values() if record["relay_id"] == identity]
+        return [record["node_name"] for record in self.records.values()
+                if record["relay_id"] == identity or (record.get("remote_relay") and
+                   identity in (record["remote_relay"]["entry_id"], record["remote_relay"]["exit_id"], record["remote_relay"].get("pending_exit_id")))]
 
 
 @dataclass
@@ -207,28 +253,15 @@ class SingBox:
     def tags(identity):
         if not re.fullmatch(r"[0-9a-f]{32}", identity):
             raise DeployError("安装标识无效。")
-        return f"okp-{identity}-ss-in", f"okp-{identity}-vless-out"
-
-    @staticmethod
-    def named_tags(name, protocol="vless"):
-        name = re.sub(r"[^\w.-]+", "-", name).strip("-.")
-        if protocol == "shadowsocks":
-            protocol = "ss"
-        if not name or len(name) > 100 or protocol not in ("vless", "socks", "ss"):
-            raise DeployError("节点名称不能生成有效的 sing-box tag。")
-        return f"ss-{name}-in", f"{protocol}-{name}-out"
+        return f"okp-{identity}-in", f"okp-{identity}-out"
 
     @staticmethod
     def validate_metadata(identity, metadata):
         inbound, outbound = SingBox.tags(identity)
         keys = {"config_file", "inbound_tag", "outbound_tag", "hashes", "needs_reload", "backup_file"}
-        if not isinstance(metadata, dict) or set(metadata) not in (keys, keys | {"owner_id"}):
+        if not isinstance(metadata, dict) or set(metadata) != keys | {"owner_id"}:
             raise ValueError("invalid sing-box ownership")
-        legacy = metadata["inbound_tag"] == inbound and metadata["outbound_tag"] == outbound
-        named = (metadata.get("owner_id") == identity and
-                 re.fullmatch(r"ss-[\w.-]+-in", metadata["inbound_tag"]) and
-                 re.fullmatch(r"(?:vless|socks|ss)-[\w.-]+-out", metadata["outbound_tag"]))
-        if (not (legacy or named)
+        if (metadata["owner_id"] != identity or metadata["inbound_tag"] != inbound or metadata["outbound_tag"] != outbound
                 or not Path(metadata["config_file"]).is_absolute() or type(metadata["needs_reload"]) is not bool
                 or set(metadata["hashes"]) != {"inbound", "outbound", "rule"}):
             raise ValueError("invalid sing-box ownership")
@@ -367,7 +400,7 @@ class SingBox:
             raise DeployError("其他 sing-box 配置仍引用此部署，需先解除共享/链式引用。")
         return remainder
 
-    def plan(self, identity, vless_link=None, ss_link=None, metadata=None, remove=False, name=None, relay_tag=None,
+    def plan(self, identity, vless_link=None, ss_link=None, metadata=None, remove=False, relay_tag=None,
              outbound_config=None):
         original, document = self.read()
         candidate = self.owned(document, identity, metadata, allow_references=not remove)
@@ -379,9 +412,7 @@ class SingBox:
                 raise DeployError("未完成事务的 sing-box 备份无效，请先核验备份。") from None
             if previous_remainder != candidate:
                 raise DeployError("未完成事务后，其他 sing-box 配置发生变化；请先核验，避免回滚覆盖手动修改。")
-        protocol = outbound_config.get("type", "vless") if outbound_config else "vless"
-        inbound_tag, outbound_tag = ((metadata["inbound_tag"], metadata["outbound_tag"]) if metadata else
-                                     self.named_tags(name, protocol) if name else self.tags(identity))
+        inbound_tag, outbound_tag = self.tags(identity)
         if remove:
             if metadata is None:
                 raise DeployError("缺少 sing-box 所有权记录。")
@@ -402,11 +433,15 @@ class SingBox:
                     raise DeployError("sing-box 中转出站不存在或指向自身。")
                 outbound["detour"] = relay_tag
             if any(i["tag"] == inbound_tag for i in candidate["inbounds"]) or any(o["tag"] == outbound_tag for o in candidate["outbounds"]):
-                raise DeployError("节点名称对应的 sing-box 标签已存在。")
+                raise DeployError("管理 ID 对应的 sing-box 标签已存在。")
             rule = {"inbound": [inbound_tag], "action": "route", "outbound": outbound_tag}
-            candidate["inbounds"].append(inbound)
-            candidate["outbounds"].append(outbound)
-            candidate["route"]["rules"].insert(0, rule)
+            in_position = next((i for i, item in enumerate(document["inbounds"]) if item["tag"] == inbound_tag), len(candidate["inbounds"]))
+            out_position = next((i for i, item in enumerate(document["outbounds"]) if item["tag"] == outbound_tag), len(candidate["outbounds"]))
+            rule_position = next((i for i, item in enumerate(document["route"].get("rules", []))
+                                  if item.get("inbound") == [inbound_tag] and item.get("outbound") == outbound_tag), 0)
+            candidate["inbounds"].insert(in_position, inbound)
+            candidate["outbounds"].insert(out_position, outbound)
+            candidate["route"]["rules"].insert(rule_position, rule)
             expected = {"inbound": digest(inbound), "outbound": digest(outbound), "rule": digest(rule)}
         payload = json.dumps(candidate, ensure_ascii=False, indent=2).encode() + b"\n"
         changed = candidate != document

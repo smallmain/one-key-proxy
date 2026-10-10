@@ -195,7 +195,7 @@ class SingBoxTests(unittest.TestCase):
     def test_registry_survives_completion_and_contains_no_proxy_credentials(self):
         state = ResumeState(self.root / ".deploy-state")
         with state.locked():
-            state.start("sync", self.root / ".env")
+            state.start("add", self.root / ".env")
             registry = resources.ManagedDeployments(state)
             registry.register(IDENTITY, "root@expired.example", self.root / ".env", "https://sublink.example", "My VPS")
             plan = self.box.plan(IDENTITY, VLESS, SS)
@@ -213,11 +213,11 @@ class SingBoxTests(unittest.TestCase):
             restored.forget(IDENTITY)
             self.assertEqual(resources.ManagedDeployments(state).records, {})
 
-    def test_named_tags_and_relay_preserve_protocol_and_children(self):
-        plan = self.box.plan(IDENTITY, VLESS, SS, name="美国")
+    def test_id_tags_and_relay_preserve_protocol_and_children(self):
+        plan = self.box.plan(IDENTITY, VLESS, SS)
         metadata = self.box.commit(plan)
-        self.assertEqual(metadata["inbound_tag"], "ss-美国-in")
-        self.assertEqual(metadata["outbound_tag"], "vless-美国-out")
+        self.assertEqual(metadata["inbound_tag"], "okp-" + IDENTITY + "-in")
+        self.assertEqual(metadata["outbound_tag"], "okp-" + IDENTITY + "-out")
         document = json.loads(self.path.read_bytes())
         document["outbounds"].append({"type": "socks", "tag": "socks-home-out", "server": "home.example",
                                        "server_port": 1080, "detour": metadata["outbound_tag"]})
@@ -225,9 +225,9 @@ class SingBoxTests(unittest.TestCase):
         changed = self.box.plan_relay(IDENTITY, metadata, "template-out")
         metadata = self.box.commit(changed)
         current = json.loads(self.path.read_bytes())
-        managed = next(o for o in current["outbounds"] if o["tag"] == "vless-美国-out")
+        managed = next(o for o in current["outbounds"] if o["tag"] == self.box.tags(IDENTITY)[1])
         self.assertEqual(managed["detour"], "template-out")
-        self.assertEqual(next(o for o in current["outbounds"] if o["tag"] == "socks-home-out")["detour"], "vless-美国-out")
+        self.assertEqual(next(o for o in current["outbounds"] if o["tag"] == "socks-home-out")["detour"], self.box.tags(IDENTITY)[1])
         self.box.commit(self.box.plan_relay(IDENTITY, metadata, None))
         with self.assertRaises(resources.DeployError):
             self.box.plan(IDENTITY, metadata=metadata, remove=True)
@@ -241,6 +241,32 @@ class SingBoxTests(unittest.TestCase):
         self.write(document)
         with self.assertRaises(resources.DeployError):
             self.box.plan_relay(IDENTITY, metadata, "template-out")
+
+    def test_metadata_requires_id_tags_and_explicit_owner(self):
+        metadata = self.install()
+        for inbound, outbound in (("ss-Old-in", "vless-Old-out"),
+                                  ("okp-" + IDENTITY + "-ss-in", "okp-" + IDENTITY + "-vless-out")):
+            with self.subTest(inbound=inbound), self.assertRaises(ValueError):
+                self.box.validate_metadata(IDENTITY, dict(metadata, inbound_tag=inbound, outbound_tag=outbound))
+        metadata.pop("owner_id")
+        with self.assertRaises(ValueError):
+            self.box.validate_metadata(IDENTITY, metadata)
+
+    def test_old_inventory_and_resume_versions_are_rejected(self):
+        state = ResumeState(self.root / ".deploy-state")
+        with state.locked():
+            registry = resources.ManagedDeployments(state)
+            registry.register(IDENTITY, "root@host", self.root / ".env", "https://sublink.example", "Node")
+            document = json.loads(registry.path.read_bytes())
+            document["version"] = 1
+            resources.atomic_write(registry.path, json.dumps(document).encode())
+            with self.assertRaises(resources.DeployError):
+                resources.ManagedDeployments(state)
+            state.start("add", self.root / ".env")
+            checkpoint = dict(state.data, version=1)
+            resources.atomic_write(state.path, json.dumps(checkpoint).encode())
+            with self.assertRaises(resources.DeployError):
+                state.load()
 
     def test_registry_detects_relay_cycles_and_dependents(self):
         state = ResumeState(self.root / ".deploy-state")

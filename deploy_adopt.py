@@ -87,13 +87,13 @@ def prepare_adoption(client, box, registry, manifest, env_file):
         expected_dialer = nodes[relay_group["remote_node_id"]]["Name"] if relay_group else ""
         if outbound.get("detour") != expected_detour or remote.get("DialerProxyName", "") != expected_dialer:
             raise DeployError("sing-box 与 SublinkPro 的现有中转关系不一致。")
-        new_in, new_out = box.named_tags(name, outbound["type"])
+        new_in, new_out = box.tags(identity)
         replacements[group["inbound"]] = new_in
         replacements[group["outbound"]] = new_out
         node_before = node_fields(client, local)
         node_updates.append({"id": local["ID"], "before": node_before,
                              "after": dict(node_before, link=marked_link(local["Link"], "okp-local:" + identity), nameMode="remark")})
-        airport_name = name
+        airport_name = ""
         if group["airport_id"] is not None:
             airport = client.request(f"airports/{group['airport_id']}")
             if remote.get("SourceID") != airport["id"]:
@@ -113,7 +113,7 @@ def prepare_adoption(client, box, registry, manifest, env_file):
                              "remote_node_id": group["remote_node_id"], "airport_name": airport_name, "node_name": name,
                              "local_port": port, "kind": "adopted", "status": "adopting", "singbox": None,
                              "local_source": "custom" if outbound["type"] == "socks" else "remote",
-                             "remote_fingerprints": [],
+                             "remote_fingerprints": [], "ssh": None, "server": None, "residential": False, "part_errors": {}, "remote_relay": None,
                              "relay_id": identities[relay] if relay else None}
     try:
         tuple(graphlib.TopologicalSorter({key: [r["relay_id"]] if r["relay_id"] else [] for key, r in records.items()}).static_order())
@@ -192,8 +192,7 @@ def adopt_manifest(config, env_file, manifest_path, state):
             if identity not in journal["records"]:
                 continue
             group = next(g for g in manifest["groups"] if g["name"] == record["node_name"])
-            old_type = next(o["type"] for o in journal["before_config"]["outbounds"] if o["tag"] == group["outbound"])
-            inbound_tag, outbound_tag = box.named_tags(record["node_name"], old_type)
+            inbound_tag, outbound_tag = box.tags(identity)
             inbound = next(i for i in after["inbounds"] if i["tag"] == inbound_tag)
             outbound = next(o for o in after["outbounds"] if o["tag"] == outbound_tag)
             rule = next(r for r in after["route"]["rules"] if r.get("inbound") == [inbound_tag] and r.get("outbound") == outbound_tag)

@@ -86,7 +86,8 @@ The Chinese management menu returns after each operation:
 2. 添加配置 (Add)
 3. 删除配置 (Delete)
 4. 查看配置 (View)
-5. 检查环境 (Check environment)
+5. 更新面板 (Update panels)
+6. 检查环境 (Check environment)
 0. 退出 (Exit)
 ```
 
@@ -129,15 +130,15 @@ python3 deploy.py add 'https://your-vps.example/sub/your-token' --no-local-node
 python3 deploy.py add --subscription-url 'https://your-vps.example/sub/your-token' --airport-name "My airport" --node-name "Hong Kong" --local-port 7900
 ```
 
-Airport and node names are independently configurable. First interactive imports require both names before SSH or subscription fetching, checkpointing each answer immediately without defaulting to the VPS hostname. An explicit `OKP_NODE_NAME` may provide the installation node-name default. Saved and managed names are reused; explicit flags take precedence, including when a resumed VPS still exports an older name. Noninteractive first imports retain source-name defaults when names are omitted. `--name` aliases `--node-name`; the old `sync` command remains an alias for `add`.
+Airport and node names are independently configurable. First interactive imports require both names before SSH or subscription fetching, checkpointing each answer immediately without defaulting to the VPS hostname. An explicit `OKP_NODE_NAME` may provide the installation node-name default. Saved and managed names are reused; explicit flags take precedence, including when a resumed VPS still exports an older name. Noninteractive first imports retain source-name defaults when names are omitted. `--name` aliases `--node-name`. Use `add` to update existing sources; the old `sync` command is no longer accepted.
 
 HTTP/HTTPS subscription URLs are supported. For airport-only imports, SublinkPro handles its supported formats. Creating a local outbound requires a plain URI list or Base64 subscription containing **VLESS TCP + REALITY + Vision**. Choose one compatible node interactively when there are several, or pass `--subscription-node 1`. Resume stores its connection fingerprint so reordering cannot select another node. The airport retains the whole subscription. Self-signed certificates require the wizard option or `--insecure-subscription`; redirects require entering the final URL. Interactive URL input avoids putting access tokens in shell history.
 
 `--local-node` and `--no-local-node` override the wizard and `.env`. `--local-port` implies local nodes and conflicts with `--no-local-node`. Local nodes require sing-box configuration and always configure both systems. Disabling local nodes leaves existing local resources intact; use Delete to remove them. `install --no-sync` installs only the VPS.
 
-Companion nodes are named `[SM]{node name} - 本地` and connect to `127.0.0.1:local-port`. The first import requires a port from `1–65535`; updates reuse it unless overridden. This port belongs to the Surge device, not the VPS. sing-box tags use `ss-{name}-in` and `vless-{name}-out`; adopted SOCKS exits use `socks-{name}-out`. Tags stay stable after creation to preserve relay references.
+Companion nodes are named `[SM]{node name} - 本地` and connect to `127.0.0.1:local-port`. New nodes select an available port starting at `7896`, skipping SublinkPro local SS ports, configured sing-box listeners and system TCP/UDP listeners. The TUI shows the default; press Enter to accept it or enter a port from `1-65535`. Noninteractive imports also select a port when `--local-port` is omitted. Existing nodes retain their port unless overridden; the port edit prompt accepts Enter to keep it. The selected port is checkpointed and reused after failure. This port belongs to the Surge device, not the VPS. sing-box tags use `okp-{managementID}-in` and `okp-{managementID}-out`, staying unchanged after name or protocol changes.
 
-The SSH wizard supports host password (default), private key, or SSH configuration/agent. A blank port retains SSH defaults; override with `--port 2222`. Host aliases are supported. **Do not put a password after `--password`**: OpenSSH performs host verification and hidden terminal authentication, then reuses a shared connection. Passwords never enter Python, process arguments, environment variables, or temporary files. `--identity ~/.ssh/my_key` selects a private key and conflicts with password mode. Direct commands without authentication flags retain SSH configuration/agent behavior.
+The SSH wizard supports host password (default), private key, or SSH configuration/agent. Bare hosts and SSH aliases default to `root`; explicit `user@host` retains that username. A blank port retains SSH defaults; override with `--port 2222`. Host aliases are supported. **Do not put a password after `--password`**: enter it privately in the terminal once, then reuse the saved credential for the same user, host and port. OpenSSH retrieves it through askpass; passwords do not enter process arguments, environment variables or logs. Host keys still require user confirmation. Rejected authentication clears the saved password; network failures retain it. `--identity ~/.ssh/my_key` selects a private key and conflicts with password mode; private-key contents are not copied. Direct commands without authentication flags retain SSH configuration/agent behavior.
 
 Install uploads local runtime sources, including uncommitted edits, without requiring a GitHub push. An allowlist excludes `.env`, Git history and SublinkPro credentials. AliDNS and installation defaults cross SSH stdin into a root-only temporary file; the VPS installer retains its confirmation page. AliDNS credentials remain in protected VPS configuration for renewal. Temporary files are cleaned up on completion/interruption, with manual cleanup potentially needed after a disconnect.
 
@@ -153,6 +154,10 @@ okp add --node-file /absolute/path/private-node.txt --node-name "Home" --local-p
 `okp` is a locally configured shell alias; `python3 deploy.py` works without it. `--node-file` requires a user-owned `0600` regular file. Interactive input and private files avoid storing credentials in shell history.
 
 VLESS, Shadowsocks and SOCKS5 are supported and checked against SublinkPro's link parser. Local VLESS conversion supports TCP/raw, WebSocket, gRPC, plain TLS, and TCP REALITY with optional Vision. Shadowsocks supports standard share formats and ciphers accepted by the sing-box binary; plugin extensions are not converted locally. SOCKS5 supports optional credentials and IPv6. Unsupported local parameters fail explicitly; use airport-independent remote storage alone or provide a supported local outbound.
+
+Add asks whether the node is residential, defaulting to No for new configurations. Yes adds the `家宽` tag to the remote node and its companion local SS. Change it in a standalone node's edit menu, an airport's details, or a remote combination's relay settings. Edits default to the current tag; No removes only `家宽`, preserving `稳定` and other tags. Airport changes apply to all currently imported nodes of that configuration. Adding a residential subscription waits for imported nodes, with recoverable failures. Tag-only changes preserve IDs, names and connections without reloading sing-box or Xray. New remote combinations do not inherit A/B's residential tag; newly enabled local SS follows its remote node.
+
+For noninteractive calls, use `--residential` / `--no-residential`, for example `python3 deploy.py edit NodeName --residential`. Omitting the flag preserves existing nodes' residential tags.
 
 The local outbound normally follows the remote link. A separate local link preserves combinations such as a VLESS remote node with a SOCKS residential exit:
 
@@ -174,27 +179,42 @@ okp edit Residential --no-local-node
 okp edit Residential --via US
 ```
 
-`edit --no-local-node` confirms and removes the companion SS node and sing-box listener/outbound/route, preserving the remote node. `add --no-local-node` continues to skip local changes. References from other local outbounds block disabling. Renaming a relay updates its managed dependent nodes' dialer names; unmanaged references block renaming. Existing sing-box tags remain stable; new Shadowsocks outbounds use `ss-{name}-out`.
+`edit --no-local-node` confirms and removes the companion SS node and sing-box listener/outbound/route, preserving the remote node. `add --no-local-node` continues to skip local changes. References from other local outbounds block disabling. Renaming a relay updates its managed dependent nodes' dialer names; unmanaged references block renaming. All managed sing-box inbounds and outbounds use `okp-{managementID}-in` and `okp-{managementID}-out`, without display names or protocols. Tags remain unchanged after renaming or protocol changes; a name-only edit does not reload sing-box.
 
 Standalone nodes receive independent, stable management IDs. Explicit `edit` operations preserve IDs across name, address or password changes. Connection fingerprints ignore remarks and query ordering to recognize repeated imports. Adding a different connection creates a different configuration; use `edit` to replace one. Existing unowned manual nodes require `--adopt-node <node-id>` or confirmation in the wizard; airport-owned nodes cannot be silently converted to standalone nodes.
 
-Standalone records have `airport_id=null`, an empty `airport_name`, and use `remote_node_id`. New records use `kind=node`; adopted records retain `kind=adopted`. `local_source=remote/custom` describes the local outbound, and `remote_fingerprints` stores only digests. Older inventory files are migrated compatibly without changing IDs.
+Standalone records have `airport_id=null`, an empty `airport_name`, and use `remote_node_id`. New records use `kind=node`; adopted records retain `kind=adopted`. `local_source=remote/custom` describes the local outbound, and `remote_fingerprints` stores only digests. Inventory uses version 3; install/add/node-edit checkpoints use version 2. Older data requires a one-time migration; runtime code does not fill missing old fields or accept old tags or recovery formats.
 
-Each change validates links, conflicts and any sing-box candidate before writing a private `node-change-*.json` transaction. After partial success, use `okp --resume` or reopen that node to continue. New parameters, deletion and separate relay operations cannot replace an unfinished transaction. External edits stop recovery. Active journals are cleared on success; `node-backup-*.json` snapshots of modified resources and sing-box backups remain for inspection. Backups contain sensitive parameters and are user-owned `0600` Git-ignored files. Recovery files may temporarily contain links; the inventory does not store full links or passwords.
+### Optional Configuration Parts
+
+Each configuration retains a stable management ID and name. Its node source, local node, SSH connection and 3x-ui management are optional. Select Add → Fill later, or run `python3 deploy.py add --partial --node-name NAME`, to save basic information. Local SS can use an independent outbound without a remote source; adding a source later preserves its port and independent outbound.
+
+Details show configured, unset, pending or failed parts. `active` describes completion of resource transactions. Features verify their actual dependencies before running: a remote exit needs a convertible source, while the entry also needs SSH and 3x-ui management. Fill missing configuration and continue returns to the original saved relay creation.
+
+Edit configuration provides each part, also available through `edit ID --part ssh`, `--part server` or `--part source`. Private `.deploy-state/part-PART-ID.json` checkpoints preserve inputs independently. SSH configuration survives later API failures, and pending server configuration does not block unrelated node edits.
+
+Existing manually installed 3x-ui can complete management configuration. Enter an admin API token privately in the terminal. The independent component verifies the original client UUID, REALITY settings, inbound ID/tag, panel version and API permissions before writing management files. API calls run on the SSH server's loopback interface; HTTPS verifies certificates using the supplied hostname, while HTTP is restricted to loopback. Components live in `/usr/local/lib/one-key-proxy-relay/` and private state/snapshots in `/etc/one-key-proxy-relay/`. Existing clients, inbounds, ports, routing and service settings are retained. Installer ownership and automatic panel upgrades are not introduced.
+
+Each change validates links, conflicts and any sing-box candidate before writing a private `node-change-*.json` transaction. After partial success, use `okp --resume` or reopen that node to continue. If link validation or a port conflict fails before resources are written, the TUI offers Restart so you can revise the input. Restarting Add removes only an unused registration and preserves existing configurations. Once resource writes start, Restart and `--fresh` cannot replace the transaction; new parameters, deletion and separate relay operations must wait for completion. References to the companion local SS name also block renaming. External edits stop recovery. Active journals are cleared on success; `node-backup-*.json` snapshots of modified resources and sing-box backups remain for inspection. Backups contain sensitive parameters and are user-owned `0600` Git-ignored files. Recovery files may temporarily contain links; the inventory does not store full links or passwords.
 
 ### Updates and recovery
 
-SSH imports use the VPS installation ID; URL imports derive a stable management ID from the SublinkPro instance and full URL. Repeating the same source updates the same airport independently of display names. A changed direct subscription URL is a new source; remove the old configuration and add the new one. Ownership uses a standalone `[okp:management-id]` airport remark and `okp-local:management-id` local link fragment, separate from display names. Existing settings are preserved unless explicitly overridden. Unmarked manual resources are not automatically adopted.
+SSH imports use the VPS installation ID; URL imports derive a stable management ID from the SublinkPro instance and full URL. Repeating the same source updates the same airport independently of display names. Adding a different subscription URL creates a new source; editing the source part of an existing configuration retains its management and airport IDs. Ownership uses a standalone `[okp:management-id]` airport remark and `okp-local:management-id` local link fragment, separate from display names. Existing settings are preserved unless explicitly overridden. Unmarked manual resources are not automatically adopted.
 
-Each completed input is immediately checkpointed in `.deploy-state/pending.json`. Failure or interruption retains it; enter Install/Add to continue or restart, or use:
+Install/Add inputs are immediately checkpointed in `.deploy-state/pending.json`. Node edits use `edit-managementID.json`, preserving unrelated Install/Add input without being blocked by it. Failure or interruption retains the record; enter Install/Add or that node's edit menu to continue, or use:
 
 ```bash
 python3 deploy.py --resume
 python3 deploy.py --resume --local-port 7901
+python3 deploy.py edit NodeName --resume
 python3 deploy.py install root@another-vps --fresh
 ```
 
-Matching retries reuse saved input, with explicit flags taking precedence. Host passwords, private-key contents, API keys and raw VLESS URIs are not cached. **A directly supplied subscription URL, including its possible access token, is stored in the private recovery file.** The directory is `0700`, files are `0600`, writes are atomic and locked, and the whole directory is Git-ignored and excluded from VPS uploads. One unfinished workflow is retained per project; only success of all enabled steps clears it. Check and Exit leave it intact.
+Matching retries reuse saved input, with explicit flags taking precedence. Private-key contents and SublinkPro API keys are not copied into checkpoints. A 3x-ui admin token is held in the private part checkpoint during setup; success retains it in a local panel credential file as well as the server's protected maintenance credentials. **Direct subscription URLs and node links may contain credentials and are stored in private recovery files.** The directory is `0700`, files are `0600`, writes are atomic and share a process lock, and the whole directory is Git-ignored and excluded from VPS uploads. Each project retains one Install/Add workflow and a separate edit record per node. Only success of all enabled steps clears a record; Check and Exit leave it intact. Bare `--resume` prioritizes Install/Add, otherwise resumes a single pending node edit; multiple edits require selecting a node. `edit --fresh` replaces only that node's saved input and cannot replace a transaction that has started writing resources.
+
+SSH passwords live in `.deploy-state/ssh-auth-{target-hash}.json`; panel URLs and tokens live in `.deploy-state/panel-api-{management-ID}.json`. These are user-owned plaintext `0600` files in a `0700` directory, without encryption or system-keychain storage. SublinkPro credentials remain in the private `.env`; proxy credentials can also occur in sing-box configuration and protected recovery backups. Removing a configuration deletes its panel credentials; shared SSH credentials are retained by target.
+
+Use **View -> select entry or remote relay -> Diagnose panel** to read panel/core versions, REALITY client-version limits, and original account/transport matches through the API without changing the panel or proxy configuration. An existing entry with no local token retrieves it over its bound SSH connection; the first login still needs its previously unsaved SSH password. The direct command is `python3 deploy.py inspect-panel ConfigurationName`. Sanitized results go to `.deploy-state/panel-report-{management-ID}.json`, excluding tokens, UUIDs and keys.
 
 Once VPS installation has been verified, resume reads the VPS and retries adding resources without rerunning the installer; a changed installation ID stops recovery. Integration failure does not roll back the VPS. Airport and local-node settings are verified by API readback, while subscription fetching and detection remain asynchronous. New resources do not alter existing subscriptions' fixed selections.
 
@@ -202,7 +222,7 @@ Once VPS installation has been verified, resume reads the VPS and retries adding
 
 Candidate configurations must pass the actual `sing-box check` before a `0600` backup, atomic replacement and LaunchAgent restart. Restart briefly interrupts connections; failure attempts rollback. External edits, port conflicts and shared references guard against accidental overwrite/deletion. Sensitive backups live beside the configuration as `.one-key-proxy-backup-*.json`. Check validates dotenv, OpenSSH, API authentication and enabled sing-box configuration without altering resources or restarting services.
 
-Use **View → select configuration → Relay settings** to choose whether that node needs a relay and which managed node to use. Install/Add also offers relay selection. CLI shortcuts remain available:
+Use **View → select configuration → Relay settings → Local relay** to choose whether that node needs a local relay and which managed node to use. Install/Add also offers local relay selection. CLI shortcuts remain available:
 
 ```bash
 python3 deploy.py relay Residential --via US
@@ -211,6 +231,38 @@ python3 deploy.py add root@your-vps --via US
 ```
 
 Relay changes update sing-box `detour` and the SublinkPro remote node's `DialerProxyName`, preserving protocol, host, port and credentials. Chains are supported, cycles and self-reference are rejected, and referenced relays cannot be deleted. Local SS continues to use loopback. Subscription downloading is independent of the data relay. Failed relay changes retain `relaying` status; reopen that configuration's relay settings to continue.
+
+### Server-side relays
+
+Use **View → select exit B → Relay settings → Remote relay**, then select a managed entry VPS A. Each combination publishes a separate ordinary VLESS node: `client → A's 3x-ui → B → destination`. Combinations share A's REALITY port and transport settings but have independent accounts and user routes. The original A/B nodes and the global default outbound remain intact. Supported exits are compatible VLESS TCP/WS/gRPC with TLS or REALITY, plugin-free AEAD/2022 Shadowsocks, and SOCKS5. Cleartext VLESS and remote combinations as exits are rejected.
+
+A needs 3x-ui **3.8.0+ within 3.x**, admin API permissions and a uniquely matched VLESS REALITY Vision source. The TUI can fill missing source, SSH and server management before continuing the saved operation. Project installations reuse their runtime/token; manual installations use the independent component with a privately entered admin token. Existing client and inbound identities are verified. An insufficient version offers an immediate update and resumes the original operation, reusing saved names, ports and API input. SSH passwords are retained in private local credential files; private-key contents are not copied.
+
+Creation saves a draft immediately after entry selection, checkpointing every name, residential setting, local SS port, and SSH answer. After interrupted input or failed SSH, return to B → Relay settings → Remote relay and choose Resume. Before remote writes, Edit SSH settings and Start over are also available. After confirmation, resuming keeps the same management ID and transaction without repeating confirmed input. Export recreates a missing runtime lock directory after reboot and distinguishes authentication, runtime files, installation state, and lock contention failures. Local adoption alone does not mean the server was installed by this project.
+
+The default base name is `B(A中转)`, with `[SM]` added for SublinkPro and ` - 本地` appended for optional local SS. The local SS outbound connects only to A. Default names follow A/B renames and exit replacements, including both published display names and managed dialer references. Rename through the combination's relay settings to retain a manual name across source renames, syncs and exit replacements. Linked renames share a recoverable transaction; conflicts and unmanaged references block the change. IDs, accounts, connection parameters and sing-box tags remain unchanged. A name-only edit needs no entry connection or sing-box/Xray reload.
+
+```bash
+python3 deploy.py remote-relay Residential --entry US --no-local-node
+python3 deploy.py remote-sync 'Residential(US中转)'
+python3 deploy.py edit 'Residential(US中转)' --node-name 'US residential'
+python3 deploy.py remote-relay 'US residential' --exit-node AnotherExit
+python3 deploy.py remove 'US residential'
+```
+
+Changing B's remote link or syncing its subscription updates dependent combinations. Renaming a standalone node, changing its residential tag, or editing its local SS or local outbound does not sync the entry and can finish while the entry is offline. Subscription fingerprint changes require explicit reselection; there is no background relay refresh. Pending combination changes retain their original parameters; submit new parameters after finishing the original operation. Unavailable exits fail without falling back to A's direct IP. 3x-ui applies changes live where possible and may briefly restart Xray. Existing API/blocking rules keep their priority; B controls final destination connections and domain resolution.
+
+New accounts remain disabled until the template, runtime route and exit connectivity have been verified. Private `0600` journals on A (`/etc/one-key-proxy/remote-relays/`) and the client (creation drafts in `.deploy-state/remote-create-*.json`, publication in `.deploy-state/remote-relay-*.json`) retain partial progress and may contain proxy credentials. Resume from the original exit's remote relay menu or from registered combination details. Failed creation before local publication can also be cancelled by deleting it. Deletion needs A online and cleans only owned client/outbound/routing resources; offline deletion retains progress. Referenced A/B nodes cannot be deleted, and server reconfiguration/uninstallation requires clearing its combinations first.
+
+### Update panels
+
+Main menu **5. Update panels**, also available as `python3 deploy.py update-panels`, lists separate current and target versions for 3x-ui and Xray. Panels use the latest stable release within their current major; Xray uses the latest available official numeric release within the compatibility limit. All eligible updates are selected by default, including core-only adjustments when the panel is already current. Incompatible newer cores are downgraded to the compatible target. Toggle `[x]` with space/comma-separated numbers, then choose `u` and confirm. Multiple configurations on the same server share one update. Missing SSH, failed detection or an unavailable compatible core prevents selection; `d NUMBER` fills SSH before another scan. Source and API management are not prerequisites for updating.
+
+`MIN_PANEL_VERSION` in `lib/panel_version.py` remains `3.8.0`. Panels have no update ceiling; prereleases, development builds, downgrades and automatic major changes are excluded. The independent `MAX_XRAY_VERSION = '26.7.28'` limits cores because sing-box REALITY cannot meet Xray 26.9.8+'s ML-KEM handshake requirement. The source comment links [upstream issue #4520](https://github.com/SagerNet/sing-box/issues/4520); remove the core ceiling only after the fix and end-to-end verification. Xray also marks older numeric releases as prereleases, so core selection accepts those official numeric tags while excluding alpha/beta/RC tags and drafts. Updating 2.x to its latest 2.x still cannot satisfy remote relay's 3.x requirement; major migration is manual. Missing API versions fall back to the server binary; unknown versions are distinct from insufficient versions.
+
+Remote relay creation, changes and sync check both panel and Xray versions and offer an immediate update before continuing when either is unsupported. Editing or filling management for a manually installed panel currently offers updates for unsupported panel versions only; it does not independently check the Xray compatibility range. Use the main panel-update menu to adjust the core when needed. Name, residential-tag and local-node edits do not check server versions.
+
+Automatic updates support standard Linux systemd installations at `/usr/local/x-ui` with SQLite at `/etc/x-ui/x-ui.db`, including manual installations. Both official assets are downloaded and checked for SHA-256 and binary version before replacement. The selected core must also accept the existing runtime configuration. Service configuration, access paths, databases and existing nodes are retained; the selected compatible core replaces the bundled one. New installations apply the same core policy. Core-only changes skip database migration. Proxy traffic pauses briefly. Protected program/core/database backups and recovery journals live under `/etc/one-key-proxy-panel`. Failed panel or core startup and health checks restore the original installation; incomplete backups are never restored. Interrupted updates can be recovered from the panel menu or while resuming the original workflow. Existing Docker, OpenRC, external-database and custom-path installations require their original update tools.
 
 ### Delete configurations
 
@@ -222,7 +274,7 @@ python3 deploy.py list --interactive
 python3 deploy.py remove <management-id-or-name>
 ```
 
-Delete previews and confirms removal of owned sing-box listeners/outbounds/routes, SublinkPro airports and imported nodes, companion local SS nodes, and adopted manual remote nodes. **No connection to the expired VPS is required** and the server is not uninstalled. External references block deletion. Interrupted deletion retains a `deleting` record; repeat to reconcile remaining resources, clearing the record only after completion.
+Delete previews and confirms removal of owned sing-box listeners/outbounds/routes, SublinkPro airports and imported nodes, companion local SS nodes, and adopted manual remote nodes. **Ordinary configurations need no connection to the expired VPS**; remote combinations need their entry online to clean server resources. Neither operation uninstalls the server. External references block deletion. Interrupted deletion retains a `deleting` record; repeat to reconcile remaining resources, clearing the record only after completion.
 
 ### Explicit adoption
 
@@ -331,7 +383,7 @@ uninstall
 
 Neither this project nor 3x-ui is updated automatically in the background. Regular VPS mode retains automatic certificate renewal, but **no DDNS task is installed**. A/AAAA records change only during initial setup or an explicitly requested address/domain reconfiguration.
 
-`update-3xui` journals recovery before running the official updater. Because the current 3x-ui v3.6 updater can randomize the deliberately fixed `/` panel path, the tool stops x-ui after the update, restores and reads back `/` through the local CLI while offline, and only then enables autostart, starts the service, and makes its first local 3x-ui API and Xray checks. After an interruption, the next maintenance operation runs this recovery first. A failed readback or health check leaves x-ui stopped with autostart disabled, while retaining both the journal and pre-update backup for diagnosis or restore.
+`update-3xui` also selects the latest stable panel release within the current major and the latest compatible Xray, using SHA-256 verified official archives while retaining the existing panel path and service configuration. It journals and backs up programs, cores and databases before replacement. Failed startup or project health checks restore the original version and project state. Subsequent maintenance settles interrupted updates first; protected backups remain available for diagnosis or restore.
 
 Domain, NAT public-IP, and certificate identity changes use a recoverable two-phase TLS state. Every maintenance operation first checks an interrupted transition against the certificate SAN and saved identity: it restarts x-ui and retains the transaction for the original operation when the new certificate is present, clears an unused transaction when the old certificate remains, or stops when neither can be proven. Active state is cleared and the result file refreshed only after the new identity passes local HTTPS/API and Xray health checks.
 

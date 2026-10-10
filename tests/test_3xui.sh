@@ -671,6 +671,36 @@ test_api_transport_uses_envelope_and_bearer_config() {
   assert_failure xui_api_get /panel/api/test
 }
 
+test_api_form_transport_keeps_credentials_in_private_body_file() {
+  XUI_API_TOKEN='token-value-123'
+  XUI_API_BASE_URL='http://127.0.0.1:2053'
+  XUI_INSTALL_RESULT_FILE=$TEST_SANDBOX/missing-install-result
+  local expected='xraySetting=%7B%22password%22%3A%22private-exit-secret%22%7D&outboundTestUrl=https%3A%2F%2Fprobe.example'
+  curl() {
+    local output_file='' body_file='' content_type='' argument snapshot=$*
+    while (($#)); do
+      argument=$1
+      shift
+      case $argument in
+        --output) output_file=$1; shift ;;
+        --data-binary) body_file=${1#@}; shift ;;
+        --header) [[ $1 != Content-Type:* ]] || content_type=$1; shift ;;
+        --config|--request|--connect-timeout|--max-time|--write-out|--noproxy) shift ;;
+      esac
+    done
+    [[ $snapshot != *private-exit-secret* && $snapshot != *token-value-123* ]] || return 71
+    assert_eq 'Content-Type: application/x-www-form-urlencoded' "$content_type" || return 1
+    assert_eq "$expected" "$(<"$body_file")" || return 1
+    assert_eq 600 "$(file_mode "$body_file")" || return 1
+    printf '%s\n' '{"success":true,"obj":{"saved":true}}' >"$output_file"
+    printf 200
+  }
+  local response
+  response=$(_xui_api_request POST /panel/api/xray/update "$expected" '' form) || return 1
+  assert_jq '.saved == true' "$response"
+  assert_failure _xui_api_request POST /panel/api/xray/update $'bad\nbody' '' form
+}
+
 test_api_transport_rejects_http_and_bad_envelopes() {
   XUI_API_TOKEN='token-value-123'
   XUI_API_BASE_URL='http://127.0.0.1:2053'
@@ -909,6 +939,7 @@ run_test 'REALITY inbound JSON satisfies the protocol contract' test_reality_inb
 run_test 'Hosts API advertises the external NAT endpoint' test_external_host_uses_public_nat_mapping
 run_test 'Xray runtime is healthy and includes the managed inbound' test_xray_runtime_requires_running_core_and_managed_config
 run_test 'API transport parses envelopes and protects the bearer token' test_api_transport_uses_envelope_and_bearer_config
+run_test 'form transport keeps proxy credentials in a private body file' test_api_form_transport_keeps_credentials_in_private_body_file
 run_test 'API transport rejects HTTP errors and malformed envelopes' test_api_transport_rejects_http_and_bad_envelopes
 run_test 'candidate API token validation uses the candidate context' test_candidate_api_token_is_validated_in_isolated_context
 run_test 'API token creation validates its one-time secret' test_api_token_creation_validates_one_time_secret

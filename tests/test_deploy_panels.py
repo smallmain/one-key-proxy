@@ -142,10 +142,10 @@ class PanelMenuTests(unittest.TestCase):
                      dict(name='美西', current='v3.9.0', eligible=False, reason='已是同 major 最新版'),
                      dict(name='未知', eligible=False, reason='SSH 未设置')]
 
-    def choose(self, answers):
+    def choose(self, answers, excluded=()):
         with patch.dict(sys.modules, {'deploy': fixtures.deploy}), patch('builtins.input', side_effect=answers), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-            result = panels.select_panels(self.rows)
+            result = panels.select_panels(self.rows, excluded)
         return result, output.getvalue()
 
     def test_all_updatable_panels_are_selected_by_default(self):
@@ -154,6 +154,15 @@ class PanelMenuTests(unittest.TestCase):
         self.assertIn('[x] 美国', output)
         self.assertIn('[-] 美西', output)
         self.assertIn('SSH 未设置', output)
+
+    def test_excluded_configurations_have_reasons_without_changing_selection_indices(self):
+        excluded = [dict(name='独立节点', reason='未绑定 SSH 或受管服务器'),
+                    dict(name='中转组合', reason='远程中转组合，不单独更新服务端')]
+        result, output = self.choose(['1', 'u'], excluded)
+        self.assertEqual(result, ('update', {2}))
+        self.assertIn('未参与服务端更新的配置：', output)
+        self.assertIn('- 独立节点：未绑定 SSH 或受管服务器', output)
+        self.assertNotIn('5. [', output)
 
     def test_multiple_toggle_clear_select_all_and_ineligible_choices(self):
         result, output = self.choose(['3', '1,2', 'u', 'a', '1', 'u'])
@@ -670,6 +679,44 @@ class PanelWorkflowTests(unittest.TestCase):
             self.assertEqual(rows[0]['target'], 'v3.9.0')
             self.assertEqual(rows[0]['core_target'], target)
 
+    def test_exclusions_distinguish_nodes_subscriptions_relays_and_pending_deletion(self):
+        identity, _ = self.fixture.add('独立节点', node_fixtures.VLESS)
+        registry = self.fixture.registry()
+        base = registry.records[identity]
+        self.assertIn('独立节点', panels.exclusion_reason(registry, identity, base))
+        self.assertIn('订阅配置', panels.exclusion_reason(registry, identity, dict(base, kind='subscription')))
+        relay = dict(base, kind='remote-relay', remote_relay={'entry_id': identity, 'exit_id': identity})
+        self.assertIn('入口：独立节点；落地：独立节点', panels.exclusion_reason(registry, identity, relay))
+        self.assertEqual(panels.exclusion_reason(registry, identity, dict(relay, status='deleting')), '删除尚未完成')
+        self.assertIsNone(panels.exclusion_reason(registry, identity, dict(base, kind='deployment')))
+        registry.update(identity, kind='adopted', airport_id=17)
+        self.assertEqual([item[0] for item in panels.candidate_records(registry)], [identity])
+        self.assertEqual(panels.excluded_records(registry), [])
+
+    def test_only_excluded_configurations_are_shown_without_ssh_or_release_queries(self):
+        self.fixture.add('独立节点', node_fixtures.VLESS)
+        with patch.dict(sys.modules, {'deploy': fixtures.deploy}), patch.object(sys.stdin, 'isatty', return_value=True), \
+                patch.object(panels, 'catalog') as catalog, patch.object(panels, 'compatible_core') as core, \
+                patch.object(panels, 'run_helper') as remote, patch.object(fixtures.deploy, 'SSH') as ssh, \
+                patch('builtins.input', side_effect=['r', '0']), contextlib.redirect_stdout(io.StringIO()) as output:
+            panels.manage_panels(SimpleNamespace())
+        self.assertIn('没有可检测的服务器配置', output.getvalue())
+        self.assertIn('独立节点：独立节点，未绑定 SSH 或受管服务器', output.getvalue())
+        for mocked in (catalog, core, remote, ssh):
+            mocked.assert_not_called()
+
+    def test_scan_is_quiet_and_keeps_authentication_failure_in_the_row(self):
+        identity, _ = self.fixture.add('美国', node_fixtures.VLESS)
+        registry = self.fixture.registry()
+        registry.update(identity, ssh={'target': 'entry.example', 'port': 22, 'identity': None, 'password': False})
+        sessions = Mock()
+        sessions.connection.side_effect = DeployError('SSH 登录失败。')
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            rows = panels.scan(registry, sessions, [], 'v26.7.28')
+        self.assertEqual(output.getvalue(), '')
+        self.assertEqual(rows[0]['reason'], 'SSH 登录失败。')
+        self.assertFalse(rows[0]['eligible'])
+
     def test_main_menu_updates_one_shared_panel_and_preserves_other_progress(self):
         first, _ = self.fixture.add('美国', node_fixtures.VLESS)
         second, _ = self.fixture.add('美国备用', node_fixtures.VLESS.replace('00000000-0000-4000-8000-000000000001',
@@ -705,6 +752,7 @@ class PanelWorkflowTests(unittest.TestCase):
         ssh.return_value.close.assert_called_once()
         self.assertIn('[x] 美国 / 美国备用', output.getvalue())
         self.assertIn('美西  3x-ui 未检测', output.getvalue())
+        self.assertNotIn('检测面板：', output.getvalue())
         self.assertEqual(registry.path.read_bytes(), before)
         self.assertEqual(state.path.read_bytes(), pending)
 

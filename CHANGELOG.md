@@ -45,6 +45,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Show why configurations are excluded from server updates, including unbound nodes/subscriptions and relay combinations; remove per-panel scan logs while retaining failures in the selection rows.
 - Ask for separate airport/node names before interactive SSH deployment or subscription fetching, checkpoint each answer, and preserve explicit names when resuming an already configured VPS.
 - Send the required admin scope when revoking bootstrap, rotated or orphaned API tokens on 3x-ui v3.7.0.
 - Count unfiltered curl commands explicitly on Alpine/BusyBox awk, whose empty-string `index` result differs from other awk implementations.

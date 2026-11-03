@@ -237,14 +237,38 @@ def inspect_panel(args, env_override=False):
     return report
 
 
+def exclusion_reason(registry, identity, record):
+    if record['status'] == 'deleting':
+        return '删除尚未完成'
+    if record['kind'] == 'remote-relay':
+        relay = record['remote_relay']
+        entry = registry.records[relay['entry_id']]['node_name']
+        exit_node = registry.records[relay['exit_id']]['node_name']
+        return f'远程中转组合，不单独更新服务端；入口：{entry}；落地：{exit_node}'
+    if (record['server'] or record['ssh'] or (record['airport_id'] and record['kind'] == 'adopted')
+            or record['kind'] == 'deployment'
+            or (registry.state.directory / ('part-server-' + identity + '.json')).exists()):
+        return None
+    if record['airport_id'] or record['kind'] == 'subscription':
+        return '订阅配置，未绑定 SSH 或受管服务器，无法执行服务端更新'
+    return '独立节点，未绑定 SSH 或受管服务器，无法执行服务端更新'
+
+
 def candidate_records(registry):
     return [(identity, record) for identity, record in registry.records.items()
-            if record['kind'] != 'remote-relay' and record['status'] != 'deleting'
-            and (record['server'] or record['ssh'] or (record['airport_id'] and record['kind'] == 'adopted') or record['kind'] == 'deployment'
-                 or (registry.state.directory / ('part-server-' + identity + '.json')).exists())]
+            if exclusion_reason(registry, identity, record) is None]
 
 
-def select_panels(rows):
+def excluded_records(registry):
+    rows = []
+    for identity, record in registry.records.items():
+        reason = exclusion_reason(registry, identity, record)
+        if reason is not None:
+            rows.append({'name': record['node_name'], 'reason': reason})
+    return rows
+
+
+def select_panels(rows, excluded=()):
     from deploy import prompt_text
     eligible = {index for index, row in enumerate(rows, 1) if row.get('eligible')}
     selected = set(eligible)
@@ -258,6 +282,12 @@ def select_panels(rows):
             print(f'  {index}. [{mark}] {row["name"]}  3x-ui {current} -> {target}{core}  {row["reason"]}')
             if row.get('steps'):
                 print('       ' + row['steps'])
+        if not rows:
+            print('  没有可检测的服务器配置。')
+        if excluded:
+            print('\n未参与服务端更新的配置：')
+            for row in excluded:
+                print(f'  - {row["name"]}：{row["reason"]}')
         value = prompt_text('编号切换勾选（多个用空格或逗号分隔）；a 全选，n 清空，u 更新，r 重新检测，d 编号补全 SSH，0 返回',
                             'u' if selected else '0').lower()
         if value in ('0', 'r'):
@@ -322,7 +352,6 @@ def scan(registry, sessions, available, core_target, updates=None):
                 binding = {key: values['ssh_' + key] for key in ('target', 'port', 'identity', 'password')}
         if binding:
             try:
-                print(f'检测面板：{record["node_name"]}')
                 ssh = sessions.connection(binding)
                 context = {}
                 if record['server'] and record['server']['backend'] == 'standalone':
@@ -393,19 +422,19 @@ def manage_panels(args):
         registry = ManagedDeployments(state)
         from deploy_updates import ConfigUpdates
         updates = ConfigUpdates(registry, run_helper)
-        if not candidate_records(registry):
-            print('暂无面板配置。')
+        if not registry.records:
+            print('暂无配置。')
             return
-        available = catalog(required=False)
-        core_target = compatible_core(required=False)
+        available = catalog(required=False) if candidate_records(registry) else []
+        core_target = compatible_core(required=False) if candidate_records(registry) else None
         while True:
             rows = scan(registry, sessions, available, core_target, updates)
-            action, indices = select_panels(rows)
+            action, indices = select_panels(rows, excluded_records(registry))
             if action == '0':
                 return
             if action == 'r':
-                available = catalog(required=False)
-                core_target = compatible_core(required=False)
+                available = catalog(required=False) if candidate_records(registry) else []
+                core_target = compatible_core(required=False) if candidate_records(registry) else None
                 continue
             if action == 'ssh':
                 row = rows[next(iter(indices)) - 1]

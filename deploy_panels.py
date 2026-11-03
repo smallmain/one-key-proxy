@@ -280,8 +280,6 @@ def select_panels(rows, excluded=()):
             current, target = row.get('current', '未检测'), row.get('target') or '-'
             core = f'；Xray {row.get("core_current") or "未检测"} -> {row.get("core_target") or "-"}'
             print(f'  {index}. [{mark}] {row["name"]}  3x-ui {current} -> {target}{core}  {row["reason"]}')
-            if row.get('steps'):
-                print('       ' + row['steps'])
         if not rows:
             print('  没有可检测的服务器配置。')
         if excluded:
@@ -449,7 +447,7 @@ def manage_panels(args):
             selected = [rows[index - 1] for index in sorted(indices)]
             print('将更新：' + '；'.join(row['name'] + ' 3x-ui ' + row['current'] + ' -> ' + row['target']
                   + '，Xray ' + (row.get('core_current') or '未检测') + ' -> ' + (row.get('core_target') or '-') for row in selected))
-            if not prompt_yes_no('确认更新所选配置？包括所列脚本、面板/内核、目标迁移及客户端刷新；更新前会备份，期间代理会短暂中断', True):
+            if not prompt_yes_no('确认更新所选配置？包括脚本、面板/内核、目标迁移及客户端刷新；更新前会备份，期间代理会短暂中断', True):
                 continue
             for row in selected:
                 try:

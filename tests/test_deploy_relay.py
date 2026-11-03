@@ -96,6 +96,8 @@ class FakeXui:
         self.skipped_enable = False
         self.force_enable_on_add = False
         self.private_key = "server-private-key"
+        self.reality_target = "www.cloudflare.com:443"
+        self.server_names = ["www.cloudflare.com"]
 
     def api(self, method, path, fields=None, *, form=False):
         self.calls.append((method, path, copy.deepcopy(fields), form))
@@ -113,7 +115,7 @@ class FakeXui:
             return [{"id": 42, "tag": "entry-in", "protocol": "vless", "port": 443,
                      "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
                          "privateKey": self.private_key, "settings": {"publicKey": "A" * 43},
-                         "serverNames": ["www.cloudflare.com"], "shortIds": ["abcd"]}},
+                         "target": self.reality_target, "serverNames": self.server_names, "shortIds": ["abcd"]}},
                      "settings": json.dumps({"clients": self.clients})}]
         if path == "/panel/api/clients/add":
             self.clients.append(copy.deepcopy(fields["client"]))
@@ -313,6 +315,90 @@ class ServerRelayTests(unittest.TestCase):
         self.assertEqual(len(self.api.clients), 1)
 
 
+class RealityMigrationTests(unittest.TestCase):
+    def setUp(self):
+        ServerRelayTests.setUp(self)
+        self.server.run(self.request)
+        self.journal = self.directory.parent / 'reality-pending.json'
+        self.migration = server_module.RealityMigration(self.server, self.journal)
+        self.target, self.sni = 'www.tencentcloud.com:443', 'www.tencentcloud.com'
+
+    def switch_target(self):
+        self.api.reality_target, self.api.server_names = self.target, [self.sni]
+        self.context['vless_uri'] = self.context['vless_uri'].replace('www.cloudflare.com', self.sni)
+
+    def test_migration_preserves_relay_credentials_clients_and_routes(self):
+        before = server_module.private_read(self.directory / (CHAIN + '.json'))
+        clients, template = copy.deepcopy(self.api.clients), copy.deepcopy(self.api.template)
+        self.migration.prepare(self.target, self.sni)
+        self.assertEqual(self.journal.stat().st_mode & 0o777, 0o600)
+        self.switch_target()
+        self.migration.finish(self.target, self.sni)
+        after = server_module.private_read(self.directory / (CHAIN + '.json'))
+        self.assertNotEqual(before['entry_hash'], after['entry_hash'])
+        self.assertEqual(dict(before, entry_hash=after['entry_hash']), after)
+        self.assertEqual((self.api.clients, self.api.template), (clients, template))
+        result = self.server.run(dict(self.request, operation='inspect'))
+        self.assertIn('sni=www.tencentcloud.com', result['link'])
+        self.assertEqual(parse_node_link(result['link']).auth['uuid'], before['uuid'])
+        self.assertFalse(self.journal.exists())
+
+    def test_interrupted_rebinding_of_multiple_relays_is_resumable(self):
+        second = 'd' * 32
+        self.server.run(dict(self.request, identity=second))
+        before = {identity: server_module.private_read(self.directory / (identity + '.json'))
+                  for identity in (CHAIN, second)}
+        self.migration.prepare(self.target, self.sni)
+        self.switch_target()
+        write = server_module.private_write
+        def interrupted(path, value):
+            if path.name == second + '.json':
+                raise OSError('interrupted')
+            write(path, value)
+        with patch.object(server_module, 'private_write', side_effect=interrupted), self.assertRaises(OSError):
+            self.migration.finish(self.target, self.sni)
+        self.assertTrue(self.journal.exists())
+        self.migration.finish(self.target, self.sni)
+        for identity, original in before.items():
+            current = server_module.private_read(self.directory / (identity + '.json'))
+            self.assertEqual(dict(original, entry_hash=current['entry_hash']), current)
+            self.server.run(dict(self.request, identity=identity, operation='inspect'))
+        self.assertFalse(self.journal.exists())
+
+    def test_unrelated_transport_changes_are_not_adopted(self):
+        before = (self.directory / (CHAIN + '.json')).read_bytes()
+        self.migration.prepare(self.target, self.sni)
+        self.switch_target()
+        self.api.private_key = 'unexpected-new-private-key'
+        with self.assertRaises(server_module.RelayError):
+            self.migration.finish(self.target, self.sni)
+        self.assertEqual((self.directory / (CHAIN + '.json')).read_bytes(), before)
+        self.assertTrue(self.journal.exists())
+
+    def test_credential_changes_during_migration_are_not_adopted(self):
+        self.migration.prepare(self.target, self.sni)
+        self.switch_target()
+        self.api.clients[-1]['id'] = str(uuid.uuid4())
+        with self.assertRaises(server_module.RelayError):
+            self.migration.finish(self.target, self.sni)
+        self.assertTrue(self.journal.exists())
+
+    def test_route_changes_during_migration_are_not_adopted(self):
+        self.migration.prepare(self.target, self.sni)
+        self.switch_target()
+        self.api.template['routing']['rules'][1]['outboundTag'] = 'direct'
+        with self.assertRaises(server_module.RelayError):
+            self.migration.finish(self.target, self.sni)
+
+    def test_incomplete_target_change_does_not_rebind_ownership(self):
+        self.migration.prepare(self.target, self.sni)
+        with self.assertRaises(server_module.RelayError):
+            self.migration.finish(self.target, self.sni)
+        self.assertTrue(self.journal.exists())
+        self.switch_target()
+        self.migration.finish(self.target, self.sni)
+
+
 class SubscriptionRefreshTests(unittest.TestCase):
     def make_manager(self, *, status="completed", ambiguous=False):
         state = {"pulled": False, "node_reads": 0}
@@ -417,6 +503,66 @@ class RemotePublicationTests(unittest.TestCase):
                           local_action="enable" if local else "keep", local_port=7901 if local else None,
                           residential=residential))
         return manager, calls, exit_id
+
+    def test_unified_update_refreshes_entry_sni_without_recreating_combination(self):
+        from deploy_updates import ConfigUpdates
+        manager, calls, _ = self.create_chain(local=True)
+        registry = manager.registry
+        original = copy.deepcopy(registry.records[CHAIN])
+        before = self.node(registry.records[ENTRY]['remote_node_id'])['Link']
+        exported = dict(fixtures.NODE, INSTALLATION_ID=ENTRY,
+                        VLESS_URI=before.replace('www.cloudflare.com', 'www.tencentcloud.com'))
+        updater = ConfigUpdates(registry, None)
+        updater.save(dict(version=1, identity=ENTRY, project_identity=ENTRY, before_uri=before, phase='runtime'), 'reality')
+        def transport(entry, request):
+            calls.append(copy.deepcopy(request))
+            self.assertEqual(entry['server']['fingerprint'], parse_node_link(exported['VLESS_URI']).server_fingerprint)
+            link = exported['VLESS_URI'].replace(parse_node_link(before).auth['uuid'], str(uuid.UUID(CHAIN)))
+            return {'link': parse_node_link(link).marked(CHAIN), 'installation_id': ENTRY}
+        with patch.dict(sys.modules, {'deploy': fixtures.deploy}), patch.object(deploy_relay, 'ssh_call', side_effect=transport):
+            updater.sync_local(ENTRY, exported)
+            registry.update(ENTRY, server=dict(registry.records[ENTRY]['server'],
+                fingerprint=parse_node_link(exported['VLESS_URI']).server_fingerprint))
+            self.server.state['fail_remote_once'] = True
+            with self.assertRaises(DeployError):
+                updater.sync_relays([ENTRY], exports={ENTRY: exported})
+            updater.sync_relays([ENTRY], exports={ENTRY: exported})
+        current = registry.records[CHAIN]
+        for key in ('remote_node_id', 'local_node_id', 'local_port', 'node_name', 'remote_relay'):
+            self.assertEqual(original[key], current[key])
+        link = parse_node_link(self.node(current['remote_node_id'])['Link'])
+        self.assertEqual(link.auth['uuid'], str(uuid.UUID(CHAIN)))
+        self.assertEqual(link.query['sni'], 'www.tencentcloud.com')
+        outbound = next(item for item in json.loads(self.path.read_text())['outbounds']
+                        if item['tag'] == current['singbox']['outbound_tag'])
+        self.assertEqual(outbound['tls']['server_name'], 'www.tencentcloud.com')
+        self.assertFalse(any(call['operation'] == 'delete' for call in calls))
+
+    def test_unified_update_refreshes_exit_outbound_and_preserves_entry_credentials(self):
+        from deploy_updates import ConfigUpdates
+        manager, calls, _ = self.create_chain(local=True)
+        before = VLESS.replace('example.invalid', 'exit.example')
+        exit_id, _ = self.add('VLESS落地', before)
+        manager.registry = self.registry()
+        manager.apply(manager.prepare(CHAIN, ENTRY, exit_id))
+        registry = manager.registry
+        original = copy.deepcopy(registry.records[CHAIN])
+        old_entry_link = self.node(original['remote_node_id'])['Link']
+        exported = dict(fixtures.NODE, INSTALLATION_ID=exit_id,
+                        VLESS_URI=before.replace('www.cloudflare.com', 'www.tencentcloud.com'))
+        updater = ConfigUpdates(registry, None)
+        updater.save(dict(version=1, identity=exit_id, project_identity=exit_id, before_uri=before, phase='local'), 'relays')
+        with patch.dict(sys.modules, {'deploy': fixtures.deploy}), patch.object(deploy_relay, 'ssh_call', side_effect=manager.transport):
+            updater.sync_local(exit_id, exported)
+            updater.sync_relays([exit_id], exports={exit_id: exported})
+        current = registry.records[CHAIN]
+        for key in ('remote_node_id', 'local_node_id', 'local_port', 'node_name'):
+            self.assertEqual(original[key], current[key])
+        self.assertEqual(self.node(current['remote_node_id'])['Link'], old_entry_link)
+        applied = [call for call in calls if call['operation'] == 'apply'][-1]
+        self.assertEqual(applied['outbound']['streamSettings']['realitySettings']['serverName'], 'www.tencentcloud.com')
+        self.assertEqual(current['remote_relay']['exit_fingerprint'], parse_node_link(exported['VLESS_URI']).fingerprint)
+        self.assertFalse(any(call['operation'] == 'delete' for call in calls))
 
     def test_combination_name_publication_and_local_socks_only_connects_entry(self):
         manager, calls, exit_id = self.create_chain(local=True)

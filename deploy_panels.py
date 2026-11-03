@@ -399,9 +399,6 @@ def scan(registry, sessions, available, core_target, updates=None):
                     if row.get('config_status') and not previous.get('config_status'):
                         previous.update(row)
                     previous.update(name=name, identities=identities)
-                    if row.get('migration_blocked') or previous.get('migration_blocked'):
-                        previous.update(eligible=False, migration_blocked=True,
-                                        reason='REALITY 迁移前需清理关联远程中转')
                     continue
                 by_panel[key] = row
             except DeployError as error:

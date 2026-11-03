@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -60,9 +61,6 @@ done
 ''', identity)
     values = dict(line.split('=', 1) for line in raw.splitlines())
     target = base64.b64decode(values['REALITY_TARGET'], validate=True).decode()
-    relay_dir = panel.PROJECT_CONFIG / 'remote-relays'
-    blocked = target == LEGACY_TARGET and (relay_dir.is_symlink() or
-                                          (relay_dir.exists() and any(relay_dir.glob('*.json'))))
     hashes = request.get('runtime_hashes', {})
     if not isinstance(hashes, dict) or not REQUIRED <= hashes.keys():
         raise panel.PanelError('运行文件摘要清单无效。')
@@ -79,7 +77,7 @@ done
     changed |= (LAUNCHER.is_symlink() or not LAUNCHER.is_file() or
                 hashlib.sha256(LAUNCHER.read_bytes()).hexdigest() != hashes['one-key-proxy'])
     return {'runtime_changed': changed, 'reality_target': target, 'migrate': target == LEGACY_TARGET,
-            'migration_blocked': blocked, 'project_identity': identity}
+            'reality_pending': (panel.STATE / 'reality-pending.json').exists(), 'project_identity': identity}
 
 
 def runtime_journal(panel):
@@ -178,12 +176,39 @@ def sync_runtime(panel, fd, request):
     return dict(project_info(panel, fd, request), backup=str(backup))
 
 
+def relay_migration(panel, fd, request):
+    spec = importlib.util.spec_from_file_location('okp_migration_relay', panel.PROJECT / 'lib/remote_relay.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    raw = shell(panel, fd, '''
+for key in INSTALLATION_ID INBOUND_ID INBOUND_TAG VLESS_URI NODE_INTERNAL_PORT; do
+    value=$(state_get "$key")
+    printf '%s=%s\\n' "$key" "$(_state_encode "$value")"
+done
+''', request['project_identity'])
+    values = dict(line.split('=', 1) for line in raw.splitlines())
+    values = {key: base64.b64decode(value, validate=True).decode() for key, value in values.items()}
+    context = dict(installation_id=values['INSTALLATION_ID'], inbound_id=int(values['INBOUND_ID']),
+                   inbound_tag=values['INBOUND_TAG'], inbound_port=int(values['NODE_INTERNAL_PORT']),
+                   vless_uri=values['VLESS_URI'], version=panel.binary_version())
+    try:
+        server = module.RelayServer(context, panel.PROJECT_CONFIG / 'remote-relays')
+    except module.RelayError as error:
+        raise panel.PanelError(str(error)) from None
+    return module, module.RealityMigration(server, panel.STATE / 'reality-pending.json')
+
+
 def migrate(panel, fd, request):
     status = project_info(panel, fd, request)
-    if status['migration_blocked']:
-        raise panel.PanelError('REALITY 迁移前需要清理受管远程中转。')
     if status['reality_target'] not in (LEGACY_TARGET, DEFAULT_TARGET):
+        if status['reality_pending']:
+            raise panel.PanelError('REALITY 目标与未完成的迁移不一致。')
         return dict(status, custom_target_preserved=True)
+    module, migration = relay_migration(panel, fd, request)
+    try:
+        migration.prepare(DEFAULT_TARGET, 'www.tencentcloud.com')
+    except module.RelayError as error:
+        raise panel.PanelError(str(error)) from None
     shell(panel, fd, '''
 _okp_i_load_config
 [[ $REALITY_TARGET == www.cloudflare.com:443 || $REALITY_TARGET == www.tencentcloud.com:443 ]]
@@ -191,6 +216,11 @@ maintenance_read() { [[ $1 == REALITY_TARGET ]] || return 1; REALITY_TARGET=www.
 maintenance_confirm() { [[ $1 == '确认更换 REALITY 目标？' ]]; }
 _okp_i_reconfigure_reality >/dev/null
 ''', request['project_identity'])
+    module, migration = relay_migration(panel, fd, request)
+    try:
+        migration.finish(DEFAULT_TARGET, 'www.tencentcloud.com')
+    except module.RelayError as error:
+        raise panel.PanelError(str(error)) from None
     return project_info(panel, fd, request)
 
 
@@ -202,7 +232,7 @@ def handle(request, panel):
                 if pending['project_identity'] != request.get('project_identity'):
                     raise panel.PanelError('运行文件恢复记录不属于所选服务器。')
                 return {'runtime_pending': True, 'runtime_changed': True, 'migrate': False,
-                        'migration_blocked': False, 'reality_target': '待恢复'}
+                        'reality_pending': (panel.STATE / 'reality-pending.json').exists(), 'reality_target': '待恢复'}
             return project_info(panel, fd, request)
         if request['operation'] == 'config-runtime':
             return sync_runtime(panel, fd, request)

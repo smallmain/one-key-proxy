@@ -12,7 +12,7 @@ from deploy_resources import DeployError, SingBox, atomic_write
 
 LEGACY_TARGET = 'www.cloudflare.com:443'
 DEFAULT_TARGET = 'www.tencentcloud.com:443'
-STAGES = ('runtime', 'panel', 'reality', 'local')
+STAGES = ('runtime', 'panel', 'reality', 'local', 'relays')
 
 
 class ConfigUpdates:
@@ -98,12 +98,7 @@ class ConfigUpdates:
         if steps or pending:
             steps.append('刷新订阅 / 本机节点')
         row['steps'] = '、'.join(steps) or '无需更新'
-        dependencies = any(item['remote_relay'] and identity in (
-            item['remote_relay']['entry_id'], item['remote_relay']['exit_id'], item['remote_relay']['pending_exit_id'])
-            for item in self.registry.records.values())
-        if (status['migrate'] and dependencies) or status['migration_blocked']:
-            row.update(eligible=False, migration_blocked=True, reason='REALITY 迁移前需清理关联远程中转')
-        elif pending or status.get('runtime_pending'):
+        if pending or status.get('runtime_pending') or status.get('reality_pending'):
             row.update(eligible=True, reason='配置更新未完成，可继续')
         elif row.get('updatable') and row.get('core_target') and steps:
             row.update(eligible=True, reason='可更新配置')
@@ -111,7 +106,7 @@ class ConfigUpdates:
     def sync_local(self, identity, exported):
         from deploy import SublinkPro, read_env
         from deploy_nodes import NodeManager
-        from deploy_relay import sync_dependents, RemoteRelayManager
+        from deploy_relay import RemoteRelayManager
         record = self.registry.records[identity]
         if not record['airport_id'] and not record['remote_node_id']:
             return
@@ -139,7 +134,36 @@ class ConfigUpdates:
             manager.apply(manager.prepare(identity, link=exported['VLESS_URI'],
                 local_action='enable' if enabled else 'keep', local_port=record['local_port'] if enabled else None,
                 relay_id=record['relay_id']))
-        sync_dependents(client, self.registry, config, identity)
+
+    def sync_relays(self, identities, *, preflight=False, exports=None):
+        from deploy import SublinkPro, read_env
+        from deploy_relay import RemoteRelayManager
+        from deploy_nodes import NodeManager
+        for identity, record in list(self.registry.records.items()):
+            relay = record['remote_relay']
+            if not relay or not set(identities).intersection((relay['entry_id'], relay['exit_id'], relay['pending_exit_id'])):
+                continue
+            config = read_env(record['env_file'])
+            client = SublinkPro(config, create_local_node=False)
+            if client.url != record['sublink_url']:
+                raise DeployError('中转组合绑定的 SublinkPro 地址发生变化。')
+            manager = RemoteRelayManager(client, self.registry, config)
+            try:
+                if preflight:
+                    if manager.pending(identity) or NodeManager(client, self.registry).pending(identity):
+                        manager.sync(identity, refresh_entry=True)
+                    manager.call(relay['entry_id'], {'operation': 'inspect', 'identity': identity})
+                else:
+                    selection = None
+                    if exports and relay['exit_id'] in exports:
+                        journal = self.pending(relay['exit_id'])
+                        if journal:
+                            before = parse_node_link(journal['before_uri'])
+                            if relay['exit_fingerprint'] == before.fingerprint:
+                                selection = parse_node_link(exports[relay['exit_id']]['VLESS_URI']).fingerprint
+                    manager.sync(identity, selection=selection, refresh_entry=True)
+            except DeployError as error:
+                raise DeployError(f'关联中转 {record["node_name"]} 同步未完成：{error}') from None
 
     def execute(self, row):
         from deploy import export_node
@@ -151,6 +175,7 @@ class ConfigUpdates:
                       if self.registry.records[item]['server'] and
                       self.registry.records[item]['server']['backend'] == 'project']
         journals = []
+        exports = {}
         for item in identities:
             journal = self.pending(item)
             if journal is None:
@@ -164,12 +189,15 @@ class ConfigUpdates:
         for stage in STAGES:
             for journal in journals:
                 self.save(journal, stage)
-            print(f'{row["name"]}：{dict(runtime="同步运行脚本", panel="更新面板和内核", reality="迁移 REALITY 目标", local="刷新订阅和本机节点")[stage]}。', flush=True)
+            print(f'{row["name"]}：{dict(runtime="同步运行脚本", panel="更新面板和内核", reality="迁移 REALITY 目标", local="刷新订阅和本机节点", relays="同步关联远程中转")[stage]}。', flush=True)
             if stage == 'runtime':
                 self.remote(ssh, self.request(identity, 'config-runtime', runtime_sources=self.sources))
             elif stage == 'panel':
                 self.update_panel(row)
             elif stage == 'reality':
+                status = self.remote(ssh, self.request(identity, 'config-info'))
+                if status.get('migrate') and not status.get('reality_pending'):
+                    self.sync_relays(identities, preflight=True)
                 self.remote(ssh, self.request(identity, 'config-migrate'))
             elif stage == 'local':
                 exported = export_node(ssh)
@@ -179,6 +207,9 @@ class ConfigUpdates:
                     bound = self.registry.records[item]['server']
                     self.registry.update(item, server=dict(bound,
                         fingerprint=parse_node_link(exported['VLESS_URI']).server_fingerprint))
+                    exports[item] = exported
+            elif stage == 'relays':
+                self.sync_relays(identities, exports=exports)
             else:
                 raise DeployError('未知配置更新阶段。')
         result = self.remote(ssh, dict(row.get('context', {}), operation='panel-info'))

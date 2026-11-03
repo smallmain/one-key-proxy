@@ -68,7 +68,7 @@ class ConfigWorkflowTests(unittest.TestCase):
     def test_stage_order_refreshes_binding_only_after_local_success(self):
         result = self.execute()
         self.assertEqual(result['current'], 'v3.11.0')
-        self.assertEqual(self.calls, ['config-runtime', 'panel-info', 'panel-update', 'config-migrate', 'panel-info'])
+        self.assertEqual(self.calls, ['config-runtime', 'panel-info', 'panel-update', 'config-info', 'config-migrate', 'panel-info'])
         self.assertEqual(self.registry.records[self.identity]['server']['fingerprint'],
                          parse_node_link(self.after).server_fingerprint)
         self.assertIsNone(self.manager.pending(self.identity))
@@ -138,12 +138,53 @@ class ConfigWorkflowTests(unittest.TestCase):
         self.assertTrue(rows[0]['eligible'])
         export.assert_not_called()
 
-    def test_remote_dependency_blocks_migration_before_mutation(self):
+    def test_relay_dependencies_do_not_block_configuration_updates(self):
         self.manager.remote = Mock(return_value=dict(runtime_changed=True, migrate=True,
-            migration_blocked=True, reality_target='www.cloudflare.com:443'))
+            reality_target='www.cloudflare.com:443'))
         self.manager.inspect(self.row)
-        self.assertFalse(self.row['eligible'])
-        self.assertIn('中转', self.row['reason'])
+        self.assertTrue(self.row['eligible'])
+        self.assertNotIn('清理', self.row['reason'])
+
+    def test_relay_failure_keeps_progress_after_updating_primary_binding(self):
+        attempts = []
+        def sync(identities, *, preflight=False, exports=None):
+            attempts.append(preflight)
+            if preflight:
+                return
+            self.assertEqual(self.registry.records[self.identity]['server']['fingerprint'],
+                             parse_node_link(self.after).server_fingerprint)
+            self.assertEqual(exports[self.identity]['VLESS_URI'], self.after)
+            raise DeployError('relay unavailable')
+        with patch.object(self.manager, 'sync_relays', side_effect=sync), self.assertRaises(DeployError):
+            self.execute()
+        self.assertEqual(attempts, [True, False])
+        self.assertEqual(self.manager.pending(self.identity)['phase'], 'relays')
+        self.calls.clear()
+        with patch.object(self.manager, 'sync_relays') as retry:
+            self.execute()
+        self.assertNotIn('panel-update', self.calls)
+        self.assertIsNone(self.manager.pending(self.identity))
+        self.assertFalse(retry.call_args.kwargs.get('preflight', False))
+
+    def test_relay_preflight_failure_does_not_migrate_the_server(self):
+        with patch.object(self.manager, 'sync_relays', side_effect=DeployError('SSH failed')), self.assertRaises(DeployError):
+            self.execute()
+        self.assertNotIn('config-migrate', self.calls)
+        self.assertEqual(self.live_uri, self.before)
+        self.assertIsNotNone(self.manager.pending(self.identity))
+
+    def test_pending_server_migration_resumes_before_relay_preflight(self):
+        original = self.manager.remote
+        def interrupted(ssh, request):
+            result = original(ssh, request)
+            if request['operation'] == 'config-info':
+                result['reality_pending'] = True
+            return result
+        self.manager.remote = interrupted
+        with patch.object(self.manager, 'sync_relays') as synchronize:
+            self.execute()
+        self.assertEqual(synchronize.call_count, 1)
+        self.assertNotIn('preflight', synchronize.call_args.kwargs)
 
     def test_nonproject_installation_only_updates_panel(self):
         self.registry.update(self.identity, server=None)

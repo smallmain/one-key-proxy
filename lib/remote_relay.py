@@ -58,6 +58,15 @@ def private_write(path, value):
             os.unlink(temporary)
 
 
+def entry_transport(inbound):
+    return {"protocol": inbound["protocol"], "port": inbound["port"], "listen": inbound.get("listen"),
+            "streamSettings": decode_object(inbound.get("streamSettings", {}))}
+
+
+def transport_hash(transport):
+    return hashlib.sha256(json.dumps(transport, sort_keys=True).encode()).hexdigest()
+
+
 API_BRIDGE = """
 set -eu
 export OKP_PRODUCTION_MODE=true
@@ -186,8 +195,7 @@ class RelayServer:
                 or query.get("pbk") != reality.get("settings", {}).get("publicKey")
                 or query.get("sni") not in reality.get("serverNames", []) or query.get("sid", "") not in reality.get("shortIds", [])):
             raise RelayError("The entry transport no longer matches the managed REALITY connection.")
-        shared = {"protocol": inbound["protocol"], "port": inbound["port"], "listen": inbound.get("listen"), "streamSettings": stream}
-        fingerprint = hashlib.sha256(json.dumps(shared, sort_keys=True).encode()).hexdigest()
+        fingerprint = transport_hash(entry_transport(inbound))
         if record.get("entry_hash") is not None and record["entry_hash"] != fingerprint:
             raise RelayError("The shared entry transport was modified outside this script.")
         record["entry_hash"] = fingerprint
@@ -246,6 +254,18 @@ class RelayServer:
         if not supported(self.context.get('version')):
             raise RelayError(f'Remote relay requires supported 3x-ui {MIN_PANEL_VERSION} or newer within the same major.')
 
+    def inspect_record(self, record):
+        if record["pending"] is not None or record["phase"] != "active":
+            raise RelayError("The remote relay transaction must be resumed first.")
+        template, _ = self.template()
+        merge_template(template, record["email"], record["tag"], record["inbound_tag"],
+                       record["outbound"], record["outbound"], record["rule"])
+        client = self.client(record)
+        if (client is None or client.get("enable") is not True or record["outbound"] not in template["outbounds"]
+                or record["rule"] not in template["routing"]["rules"]):
+            raise RelayError("Active relay resources were changed outside this script.")
+        self.verify_route(record, record["tag"])
+
     def run(self, request):
         identity = request.get("identity", "")
         if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{32}", identity):
@@ -286,14 +306,7 @@ class RelayServer:
             raise RelayError("The managed entry inbound identity changed.")
         template, test_url = self.template()
         if operation == "inspect":
-            if record["pending"] is not None or record["phase"] != "active":
-                raise RelayError("The remote relay transaction must be resumed first.")
-            merge_template(template, record["email"], record["tag"], record["inbound_tag"],
-                           record["outbound"], record["outbound"], record["rule"])
-            client = self.client(record)
-            if (client is None or client.get("enable") is not True or record["outbound"] not in template["outbounds"]
-                    or record["rule"] not in template["routing"]["rules"]):
-                raise RelayError("Active relay resources were changed outside this script.")
+            self.inspect_record(record)
             return self.result(record)
         if operation == "delete":
             if record["phase"] == "active" and (record["outbound"] not in template["outbounds"] or record["rule"] not in template["routing"]["rules"]):
@@ -375,6 +388,80 @@ class RelayServer:
                             fragment="okp-remote:" + record["identity"]).geturl()
         return {"link": link, "installation_id": record["installation_id"], "email": record["email"],
                 "inbound_tag": record["inbound_tag"], "outbound_tag": record["tag"]}
+
+
+class RealityMigration:
+    """Rebind relay ownership only for a journaled target/SNI change under the operation lock."""
+
+    def __init__(self, server, path):
+        self.server, self.path = server, Path(path)
+
+    def transport(self):
+        context = self.server.context
+        rows = self.server.api("GET", "/panel/api/inbounds/list")
+        owned = [row for row in rows if row.get("id") == context["inbound_id"]
+                 and row.get("tag") == context["inbound_tag"]]
+        if len(owned) != 1:
+            raise RelayError("The entry inbound is missing or ambiguous during REALITY migration.")
+        return entry_transport(owned[0])
+
+    def records(self):
+        records = {}
+        for path in self.server.directory.glob('*.json'):
+            if not re.fullmatch('[0-9a-f]{32}', path.stem):
+                raise RelayError("Unknown relay ownership file; migration stopped.")
+            record = private_read(path)
+            if (record['identity'] != path.stem or record['installation_id'] != self.server.context['installation_id']
+                    or record['inbound_id'] != self.server.context['inbound_id']
+                    or record['inbound_tag'] != self.server.context['inbound_tag']):
+                raise RelayError("Relay ownership does not match the entry being migrated.")
+            records[path.stem] = record
+        return records
+
+    def prepare(self, target, sni):
+        context = self.server.context
+        transport = self.transport()
+        records = self.records()
+        if self.path.exists():
+            journal = private_read(self.path)
+            if (set(journal) != {'installation_id', 'inbound_id', 'inbound_tag', 'target', 'sni', 'before', 'after', 'records'}
+                    or any(journal[key] != context[key] for key in ('installation_id', 'inbound_id', 'inbound_tag'))
+                    or journal['target'] != target or journal['sni'] != sni
+                    or transport not in (journal['before'], journal['after'])
+                    or set(records) != set(journal['records'])):
+                raise RelayError("REALITY migration state changed outside the recorded transaction.")
+            for identity, before in journal['records'].items():
+                rebound = dict(before, entry_hash=transport_hash(journal['after']))
+                if records[identity] not in (before, rebound):
+                    raise RelayError("Relay credentials or routing changed during REALITY migration.")
+            return journal
+        if transport['protocol'] != 'vless' or transport['streamSettings'].get('security') != 'reality':
+            raise RelayError("REALITY migration requires a VLESS REALITY inbound.")
+        for record in records.values():
+            self.server.inspect_record(copy.deepcopy(record))
+        after = copy.deepcopy(transport)
+        reality = after['streamSettings']['realitySettings']
+        reality['target'], reality['serverNames'] = target, [sni]
+        reality.pop('dest', None)
+        if reality.get('settings', {}).get('serverName'):
+            reality['settings']['serverName'] = sni
+        journal = dict(installation_id=context['installation_id'], inbound_id=context['inbound_id'],
+                       inbound_tag=context['inbound_tag'], target=target, sni=sni,
+                       before=transport, after=after, records=records)
+        private_write(self.path, journal)
+        return journal
+
+    def finish(self, target, sni):
+        journal = self.prepare(target, sni)
+        if self.transport() != journal['after']:
+            raise RelayError("REALITY migration has not applied the expected target and SNI.")
+        records = {identity: dict(record, entry_hash=transport_hash(journal['after']))
+                   for identity, record in journal['records'].items()}
+        for record in records.values():
+            self.server.inspect_record(record)
+        for identity, record in records.items():
+            private_write(self.server.directory / (identity + '.json'), record)
+        self.path.unlink()
 
 
 def main():

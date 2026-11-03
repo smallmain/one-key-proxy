@@ -394,7 +394,7 @@ class RemoteRelayManager:
         self.pending_path(identity).unlink()
         return self.registry.records[identity]
 
-    def sync(self, identity, *, selection=None, interactive=False):
+    def sync(self, identity, *, selection=None, interactive=False, refresh_entry=False):
         pending = self.pending(identity)
         if pending:
             result = self.apply(pending)
@@ -404,12 +404,15 @@ class RemoteRelayManager:
         if journal:
             if journal["box"]:
                 nodes.box = SingBox(self.config)
-            return nodes.apply(journal)
+            result = nodes.apply(journal)
+            if not refresh_entry:
+                return result
+            record = self.registry.records[identity]
         source = record["remote_relay"]
         self.refresh_source(source["exit_id"])
         if pending:
             current = self.select_exit(source["exit_id"], source["exit_fingerprint"], selection, interactive=interactive)
-            if current.fingerprint == source["exit_fingerprint"]:
+            if current.fingerprint == source["exit_fingerprint"] and not refresh_entry:
                 return result
             selection = current.fingerprint
         action = "enable" if record["singbox"] or record["local_node_id"] else "keep"

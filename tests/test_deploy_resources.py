@@ -14,15 +14,14 @@ from deploy import ResumeState
 
 IDENTITY = "a" * 32
 VLESS = "vless://00000000-0000-4000-8000-000000000001@new.example:443?security=reality&type=tcp&flow=xtls-rprx-vision&sni=www.cloudflare.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&fp=chrome"
-SS = "ss://YWVzLTEyOC1nY206bmV3LXBhc3N3b3Jk@127.0.0.1:7900#managed"
+LOCAL_LINK = "socks5://127.0.0.1:7900#managed"
 
 
 def sample_config():
     return {
         "log": {"level": "error"},
         "inbounds": [
-            {"type": "shadowsocks", "tag": "template-in", "listen": "127.0.0.1", "listen_port": 7896,
-             "method": "aes-128-gcm", "password": "old-password"},
+            {"type": "socks", "tag": "template-in", "listen": "127.0.0.1", "listen_port": 7896},
             {"type": "mixed", "tag": "other-in", "listen": "127.0.0.1", "listen_port": 10810},
         ],
         "outbounds": [
@@ -60,12 +59,12 @@ class SingBoxTests(unittest.TestCase):
         self.path.chmod(0o600)
 
     def install(self):
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         return self.box.commit(plan)
 
-    def test_clone_uses_new_credentials_and_preserves_unrelated_configuration(self):
+    def test_local_socks_preserves_unrelated_configuration(self):
         original = sample_config()
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         self.assertEqual(json.loads(self.path.read_bytes()), original)
         metadata = self.box.commit(plan)
         result = json.loads(self.path.read_bytes())
@@ -73,22 +72,29 @@ class SingBoxTests(unittest.TestCase):
         self.assertEqual(result["outbounds"][:2], original["outbounds"])
         self.assertEqual(result["route"]["rules"][1:], original["route"]["rules"])
         self.assertEqual(result["route"]["final"], "direct")
-        self.assertEqual(result["inbounds"][-1]["password"], "new-password")
-        self.assertEqual(result["inbounds"][-1]["listen_port"], 7900)
+        self.assertEqual(result["inbounds"][-1], {"type": "socks", "listen": "127.0.0.1", "listen_port": 7900,
+                                                 "tag": self.box.tags(IDENTITY)[0]})
         self.assertEqual(result["outbounds"][-1]["server"], "new.example")
         self.assertEqual(result["outbounds"][-1]["tls"]["server_name"], "www.cloudflare.com")
         self.assertFalse(metadata["needs_reload"])
-        self.assertNotIn("new-password", json.dumps(metadata))
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
         self.assertTrue(Path(metadata["backup_file"]).exists())
 
     def test_repeated_sync_does_not_duplicate_or_restart_unchanged_config(self):
         metadata = self.install()
         self.reload.reset_mock()
-        plan = self.box.plan(IDENTITY, VLESS, SS, metadata)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK, metadata)
         self.box.commit(plan)
         self.reload.assert_not_called()
         self.assertEqual(len(json.loads(self.path.read_bytes())["inbounds"]), 3)
+
+    def test_local_socks_rejects_authentication_nonloopback_and_extensions(self):
+        for link in ("socks5://user:pass@127.0.0.1:7900", "socks5://@127.0.0.1:7900",
+                     "socks5://0.0.0.0:7900", "socks5://localhost:7900", "socks5://127.0.0.1:0",
+                     "socks5://127.0.0.1:65536", "socks5://127.0.0.1:7900/", "socks5://127.0.0.1:7900?tls=1",
+                     "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@127.0.0.1:7900"):
+            with self.subTest(link=link), self.assertRaises(resources.DeployError):
+                self.box.plan(IDENTITY, VLESS, link)
 
     def test_new_config_does_not_require_existing_template_entries(self):
         self.write({"inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}],
@@ -102,7 +108,7 @@ class SingBoxTests(unittest.TestCase):
     def test_foreign_port_collision_stops_before_write(self):
         before = self.path.read_bytes()
         with self.assertRaises(resources.DeployError):
-            self.box.plan(IDENTITY, VLESS, SS.replace(":7900", ":7896"))
+            self.box.plan(IDENTITY, VLESS, LOCAL_LINK.replace(":7900", ":7896"))
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_delete_only_removes_owned_entries_and_is_idempotent(self):
@@ -131,10 +137,10 @@ class SingBoxTests(unittest.TestCase):
         document["outbounds"][-1]["server"] = "manual.example"
         self.write(document)
         with self.assertRaises(resources.DeployError):
-            self.box.plan(IDENTITY, VLESS, SS, metadata)
+            self.box.plan(IDENTITY, VLESS, LOCAL_LINK, metadata)
 
     def test_concurrent_edit_is_not_lost(self):
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         modified = sample_config()
         modified["log"]["timestamp"] = True
         self.write(modified)
@@ -144,7 +150,7 @@ class SingBoxTests(unittest.TestCase):
         self.reload.assert_not_called()
 
     def test_other_process_config_lock_blocks_commit(self):
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         lock = self.root / ".one-key-proxy.lock"
         lock.touch(mode=0o600)
         with lock.open("rb") as stream:
@@ -157,12 +163,12 @@ class SingBoxTests(unittest.TestCase):
         before = self.path.read_bytes()
         self.check.side_effect = resources.DeployError("invalid")
         with self.assertRaises(resources.DeployError):
-            self.box.plan(IDENTITY, VLESS, SS)
+            self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_failed_reload_restores_previous_configuration(self):
         before = self.path.read_bytes()
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         self.reload.side_effect = [resources.DeployError("failed"), None]
         with self.assertRaises(resources.DeployError):
             self.box.commit(plan)
@@ -170,18 +176,18 @@ class SingBoxTests(unittest.TestCase):
         self.assertEqual(self.reload.call_count, 2)
 
     def test_interrupted_commit_reloads_on_retry(self):
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         Path(plan.metadata["backup_file"]).write_bytes(plan.original)
         Path(plan.metadata["backup_file"]).chmod(0o600)
         self.path.write_bytes(plan.payload)
-        retried = self.box.plan(IDENTITY, VLESS, SS, plan.metadata)
+        retried = self.box.plan(IDENTITY, VLESS, LOCAL_LINK, plan.metadata)
         self.assertEqual(retried.original, retried.payload)
         self.assertTrue(retried.metadata["needs_reload"])
         self.assertFalse(self.box.commit(retried)["needs_reload"])
         self.reload.assert_called_once()
 
     def test_interrupted_rollback_cannot_overwrite_unrelated_later_edits(self):
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         backup = Path(plan.metadata["backup_file"])
         backup.write_bytes(plan.original)
         backup.chmod(0o600)
@@ -189,7 +195,7 @@ class SingBoxTests(unittest.TestCase):
         modified["log"]["timestamp"] = True
         self.write(modified)
         with self.assertRaises(resources.DeployError):
-            self.box.plan(IDENTITY, VLESS, SS, plan.metadata)
+            self.box.plan(IDENTITY, VLESS, LOCAL_LINK, plan.metadata)
         self.assertEqual(json.loads(self.path.read_bytes()), modified)
 
     def test_registry_survives_completion_and_contains_no_proxy_credentials(self):
@@ -198,7 +204,7 @@ class SingBoxTests(unittest.TestCase):
             state.start("add", self.root / ".env")
             registry = resources.ManagedDeployments(state)
             registry.register(IDENTITY, "root@expired.example", self.root / ".env", "https://sublink.example", "My VPS")
-            plan = self.box.plan(IDENTITY, VLESS, SS)
+            plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
             registry.update(IDENTITY, singbox=plan.metadata)
             registry.update(IDENTITY, singbox=self.box.commit(plan), status="active")
             state.complete()
@@ -206,7 +212,7 @@ class SingBoxTests(unittest.TestCase):
             self.assertIn(IDENTITY, restored.records)
             self.assertEqual(restored.select("root@expired.example"), IDENTITY)
             raw = registry.path.read_text()
-            self.assertNotIn("new-password", raw)
+            self.assertNotIn(LOCAL_LINK, raw)
             self.assertNotIn(VLESS, raw)
             self.assertNotIn("00000000-0000-4000-8000-000000000001", raw)
             self.assertEqual(registry.path.stat().st_mode & 0o777, 0o600)
@@ -214,7 +220,7 @@ class SingBoxTests(unittest.TestCase):
             self.assertEqual(resources.ManagedDeployments(state).records, {})
 
     def test_id_tags_and_relay_preserve_protocol_and_children(self):
-        plan = self.box.plan(IDENTITY, VLESS, SS)
+        plan = self.box.plan(IDENTITY, VLESS, LOCAL_LINK)
         metadata = self.box.commit(plan)
         self.assertEqual(metadata["inbound_tag"], "okp-" + IDENTITY + "-in")
         self.assertEqual(metadata["outbound_tag"], "okp-" + IDENTITY + "-out")

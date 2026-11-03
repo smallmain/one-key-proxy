@@ -78,7 +78,14 @@ def api(method, path, fields=None, *, form=False):
                             input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=100, check=False)
     if result.returncode:
         # Upstream error messages may echo proxy credentials.
-        raise RelayError("3x-ui API operation failed; the relay transaction is retained for retry.")
+        error = result.stderr or b""
+        status = re.search(rb"3x-ui API returned HTTP ([0-9]{3}) for a (?:GET|POST) request", error)
+        reason = "HTTP " + status[1].decode() if status else "request"
+        if b"transport failed" in error:
+            curl = re.search(rb"curl: \(([0-9]+)\)", error)
+            reason = "transport" + (" curl " + curl[1].decode() if curl else "")
+        endpoint = re.sub(r"(/clients/del/).*", r"\1<client>", path)
+        raise RelayError(f"3x-ui API {method} {endpoint} failed ({reason}); the relay transaction is retained for retry.")
     try:
         return json.loads(result.stdout)
     except ValueError:

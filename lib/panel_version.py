@@ -10,7 +10,8 @@ import urllib.request
 import zlib
 
 MIN_PANEL_VERSION = '3.8.0'
-# Xray >=26.9.8 requires ML-KEM absent from sing-box REALITY (SagerNet/sing-box#4520).
+# sing-box 1.14.4 still strips ML-KEM from REALITY ClientHello (SagerNet/sing-box#4520).
+# Verified 2026-11-02: stock 1.14.4 fails with Xray 26.10.31, passes with 26.7.28.
 # Limit the core independently; panel releases can bundle an incompatible Xray.
 # Set to None only after the upstream fix and end-to-end REALITY verification.
 MAX_XRAY_VERSION = '26.7.28'

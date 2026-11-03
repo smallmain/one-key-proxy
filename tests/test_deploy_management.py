@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 import test_deploy as fixtures
@@ -32,7 +33,7 @@ class MenuTests(unittest.TestCase):
         with patch("builtins.input", return_value="0"), contextlib.redirect_stdout(output):
             deploy.choose_action({"phase": "input"})
         self.assertEqual(output.getvalue().strip().splitlines()[1:], [
-            "  1. 安装配置", "  2. 添加配置", "  3. 删除配置", "  4. 查看配置", "  5. 更新面板", "  6. 检查环境", "  0. 退出"])
+            "  1. 安装配置", "  2. 添加配置", "  3. 删除配置", "  4. 查看配置", "  5. 更新配置", "  6. 检查环境", "  7. 检查连通性", "  0. 退出"])
 
     def test_check_returns_to_menu_without_touching_pending(self):
         state = deploy.ResumeState()
@@ -158,7 +159,7 @@ class MenuTests(unittest.TestCase):
     def test_subscription_wizard_does_not_ask_ssh_questions(self):
         args = argparse.Namespace(action="add", target=None, source=None, subscription_url=None,
                                   insecure_subscription=None, no_sync=False, create_local_node=None, local_port=None)
-        with patch("builtins.input", side_effect=["2", URL, "n", "y"]) as prompt:
+        with patch("builtins.input", side_effect=["3", URL, "n", "y"]) as prompt:
             deploy.configure_interactive(args, fixtures.CONFIG)
         self.assertEqual(args.source, "subscription")
         self.assertEqual(args.subscription_url, URL)
@@ -319,7 +320,7 @@ class SubscriptionWorkflowTests(unittest.TestCase):
         self.assertFalse(deploy.ResumeState().path.exists())
 
     def test_residential_url_add_tags_imported_nodes_and_preserves_other_tags(self):
-        self.server.state["nodes"] = [dict(fixtures.SS_TEMPLATE, ID=501, Name="Remote", Protocol="vless", SourceID=21,
+        self.server.state["nodes"] = [dict(fixtures.LOCAL_TEMPLATE, ID=501, Name="Remote", Protocol="vless", SourceID=21,
                                           Link=fixtures.NODE["VLESS_URI"])]
         self.server.state["tags"][501] = ["稳定", "custom"]
         self.run_cli(["add", URL, "--no-local-node", "--airport-name", "Home", "--residential"])
@@ -328,7 +329,7 @@ class SubscriptionWorkflowTests(unittest.TestCase):
         self.assertEqual(set(self.server.state["tags"][501]), {"稳定", "custom", "家宽"})
 
     def test_residential_url_tag_failure_resumes_without_recreating_airport(self):
-        self.server.state["nodes"] = [dict(fixtures.SS_TEMPLATE, ID=501, Name="Remote", Protocol="vless", SourceID=21,
+        self.server.state["nodes"] = [dict(fixtures.LOCAL_TEMPLATE, ID=501, Name="Remote", Protocol="vless", SourceID=21,
                                           Link=fixtures.NODE["VLESS_URI"])]
         self.server.state["tags"][501] = ["稳定"]
         self.server.state["fail_tags_once"] = True
@@ -371,10 +372,10 @@ class SubscriptionWorkflowTests(unittest.TestCase):
                 patch.object(deploy.SingBox, "reload"):
             self.run_cli(["add", URL, "--airport-name", "Airport", "--node-name", "Local", "--local-port", "7900"], config)
         local = self.server.state["nodes"][0]
-        port, method, password = deploy.SingBox.ss_parameters(local["Link"])
+        port = urllib.parse.urlsplit(local["Link"]).port
         document = json.loads(path.read_text())
         inbound = document["inbounds"][-1]
-        self.assertEqual((inbound["listen_port"], inbound["method"], inbound["password"]), (port, method, password))
+        self.assertEqual(inbound, {"type": "socks", "listen": "127.0.0.1", "listen_port": port, "tag": inbound["tag"]})
         record = next(iter(deploy.ManagedDeployments(deploy.ResumeState()).records.items()))
         self.assertEqual(inbound["tag"], deploy.SingBox.tags(record[0])[0])
         self.assertEqual(document["outbounds"][-1]["tag"], deploy.SingBox.tags(record[0])[1])

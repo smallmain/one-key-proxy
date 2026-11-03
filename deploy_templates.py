@@ -10,10 +10,9 @@ AIRPORT_DEFAULTS = {
     "deduplicationRule": "", "nodeNameUniquify": True, "nodeNamePrefix": "[SM]",
     "nodeNameIntraUniquify": False, "autoFillCountry": False, "backfillExistingCountry": False,
 }
-LOCAL_SS_METHOD = "aes-128-gcm"
-LOCAL_SS_PORT_START = 7896
-LOCAL_SS_GROUP = "SM"
-LOCAL_SS_TAGS = "稳定"
+LOCAL_NODE_PORT_START = 7896
+LOCAL_NODE_GROUP = "SM"
+LOCAL_NODE_TAGS = "稳定"
 RESIDENTIAL_TAG = "家宽"
 
 
@@ -28,5 +27,5 @@ def residential_tags(tags, residential):
     return sorted(values)
 
 
-SINGBOX_INBOUND = {"type": "shadowsocks", "listen": "127.0.0.1"}
+SINGBOX_INBOUND = {"type": "socks", "listen": "127.0.0.1"}
 SINGBOX_OUTBOUND = {"type": "vless"}

@@ -9,7 +9,7 @@ import uuid
 
 from deploy_links import parse_node_link
 from deploy_resources import DeployError, SingBoxPlan, atomic_write, is_standalone, remote_relay_name
-from deploy_templates import LOCAL_SS_GROUP, LOCAL_SS_TAGS, RESIDENTIAL_TAG, residential_tags
+from deploy_templates import LOCAL_NODE_GROUP, LOCAL_NODE_TAGS, RESIDENTIAL_TAG, residential_tags
 
 
 class NodeManager:
@@ -267,8 +267,11 @@ class NodeManager:
                 node = matches[0]
         if record["remote_node_id"] and (not node or node["ID"] != record["remote_node_id"]):
             raise DeployError("远端节点缺失或 ID 与记录不同。")
-        if node and record["remote_fingerprints"] and parse_node_link(node["Link"]).fingerprint not in record["remote_fingerprints"]:
-            raise DeployError("远端连接参数被外部修改，请核对受管记录与变更备份，避免覆盖。")
+        if node and record["remote_fingerprints"]:
+            link = parse_node_link(node["Link"])
+            # Older converters stored the full URI fingerprint for unsupported defaults.
+            if not {link.fingerprint, link.uri_fingerprint}.intersection(record["remote_fingerprints"]):
+                raise DeployError("远端连接参数被外部修改，请核对受管记录与变更备份，避免覆盖。")
         return node
 
     def validate_native(self, link):
@@ -315,7 +318,7 @@ class NodeManager:
         return journal
 
     def prepare(self, identity, *, link=None, name=None, local_action="keep", local_port=None,
-                local_link=None, same_local=False, relay_id=None, adopt_id=None, intent=None, residential=None, auto_name=None, airport_name=None):
+                relay_id=None, adopt_id=None, intent=None, residential=None, auto_name=None, airport_name=None):
         if residential is not None and type(residential) is not bool:
             raise DeployError("家宽设置必须为是或否。")
         self.guard_name_transaction(identity)
@@ -331,8 +334,8 @@ class NodeManager:
         if remote is None and residential is None:
             residential = record["residential"]
         source = parse_node_link(link if link is not None else remote["Link"]) if link is not None or remote else None
-        if source is None and local_action == "enable" and local_link is None and not (record["singbox"] and record["local_source"] == "custom"):
-            raise DeployError("缺少可用出站；请补全节点来源或设置独立本地出站链接。")
+        if source is None and local_action == "enable":
+            raise DeployError("请先补全节点来源，再启用本地节点。")
         if adopt_id and remote and parse_node_link(remote["Link"]).fingerprint != source.fingerprint:
             raise DeployError("接管链接与现有节点不匹配。")
         if source and self.matching_nodes(source, remote["ID"] if remote else None):
@@ -351,7 +354,7 @@ class NodeManager:
         if source and any(n["Name"] == full_name and (not remote or n["ID"] != remote["ID"]) for n in all_nodes):
             raise DeployError("远端节点名称已存在。")
         before = self.fields(remote) if remote else None
-        after = dict(before or {"group": LOCAL_SS_GROUP, "tags": LOCAL_SS_TAGS}, name=full_name,
+        after = dict(before or {"group": LOCAL_NODE_GROUP, "tags": LOCAL_NODE_TAGS}, name=full_name,
                      nameMode="remark", dialerProxyName=parent_node["Name"] if parent_node else "")
         if source:
             after["link"] = remote["Link"] if imported else source.marked(identity)
@@ -366,10 +369,9 @@ class NodeManager:
             raise DeployError("本地节点缺失或 ID 不匹配。")
         if local_action not in ("keep", "enable", "disable"):
             raise DeployError("本地节点操作无效。")
-        if local_action != "enable" and (local_port is not None or local_link is not None or same_local):
+        if local_action != "enable" and local_port is not None:
             raise DeployError("修改本地参数时必须启用本地节点。")
         box_plan = None
-        local_source = record["local_source"]
         if local_action == "enable":
             if self.box is None:
                 raise DeployError("启用本地节点必须同时配置 sing-box。")
@@ -380,28 +382,18 @@ class NodeManager:
                 raise DeployError("本地节点仍有中转引用，需先解除后再改名。")
             local_residential = residential if residential is not None or local else RESIDENTIAL_TAG in after["tags"].split(",")
             fields["tags"] = ",".join(residential_tags(fields["tags"].split(",") if fields["tags"] else [], local_residential))
-            if local_link is not None:
-                outbound = parse_node_link(local_link).outbound()
-                local_source = "custom"
-            elif local_source == "custom" and not same_local:
-                if not record["singbox"]:
-                    raise DeployError("独立本地出站尚无配置，请提供 --local-link 或选择跟随远端。")
-                document = self.box.read()[1]
-                self.box.owned(document, identity, record["singbox"], allow_references=True)
-                outbound = copy.deepcopy(next(o for o in document["outbounds"] if o["tag"] == record["singbox"]["outbound_tag"]))
-            else:
-                outbound = source.outbound()
-                local_source = "remote"
+            # Managed relay entries pass the compatible-core preflight before publication.
+            outbound = source.server_outbound() if record['kind'] == 'remote-relay' else source.outbound()
             relay_tag = None
             if parent:
                 if not parent["singbox"]:
                     raise DeployError("所选中转没有 sing-box 出站。")
                 self.box.owned(self.box.read()[1], relay_id, parent["singbox"], allow_references=True)
                 relay_tag = parent["singbox"]["outbound_tag"]
-            port = self.client.local_ss_link(dict(local or {"ID": 1, "Name": name, "Protocol": "ss"}, Link=fields["link"])).port
+            port = urllib.parse.urlsplit(fields["link"]).port
             if outbound.get("server") in ("127.0.0.1", "::1", "localhost") and outbound.get("server_port") == port:
                 raise DeployError("本地出站不能连接自身的入站端口。")
-            box_plan = self.box.plan(identity, ss_link=fields["link"], metadata=record["singbox"],
+            box_plan = self.box.plan(identity, local_link=fields["link"], metadata=record["singbox"],
                                      relay_tag=relay_tag, outbound_config=outbound)
             operations.append({"role": "local", "id": local["ID"] if local else None, "before": self.fields(local) if local else None,
                                "after": fields, "marker": "okp-local:" + identity})
@@ -416,7 +408,6 @@ class NodeManager:
             if local:
                 operations.append({"role": "local", "id": local["ID"], "before": self.fields(local),
                                    "after": None, "marker": "okp-local:" + identity})
-            local_source = "remote"
         else:
             local_port = record["local_port"]
             if local and (renaming or residential is not None):
@@ -443,7 +434,7 @@ class NodeManager:
                    "intent": intent or {},
                    "before_record": copy.deepcopy(record), "box": None,
                    "after": {"node_name": name, "airport_name": airport_name or record["airport_name"] if imported else "", "local_port": local_port,
-                             "local_source": local_source, "relay_id": relay_id, "status": "active",
+                             "relay_id": relay_id, "status": "active",
                              "remote_fingerprints": [source.fingerprint] if source else []}}
         if auto_name is not None:
             if type(auto_name) is not bool or record["remote_relay"] is None:

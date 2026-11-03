@@ -36,7 +36,8 @@ class ConfigurationPartTests(unittest.TestCase):
         self.cli(['add', '--partial', '--node-name', name])
         return self.record(name)
 
-    def part_cli(self, identity, part, answers, *, exported=None, failure=None, edit_args=(), argv=None, handler=None):
+    def part_cli(self, identity, part, answers, *, exported=None, failure=None, edit_args=(), argv=None, handler=None,
+                 project_export=None):
         calls, output = [], io.StringIO()
 
         def run(command, **kwargs):
@@ -62,7 +63,8 @@ class ConfigurationPartTests(unittest.TestCase):
                 patch('builtins.input', side_effect=answers), \
                 patch.object(deploy_parts.getpass, 'getpass', return_value='private-api-token-123456789') as secret, \
                 patch.object(fixtures.deploy, 'SSH') as ssh, \
-                patch.object(fixtures.deploy, 'export_node', side_effect=fixtures.deploy.SSHExportError('missing runtime', 103)), \
+                patch.object(fixtures.deploy, 'export_node', return_value=project_export,
+                             side_effect=None if project_export else fixtures.deploy.SSHExportError('missing runtime', 103)), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             ssh.return_value.run.side_effect = run
             fixtures.deploy.main(argv or ['edit', identity, '--part', part] + list(edit_args))
@@ -75,33 +77,40 @@ class ConfigurationPartTests(unittest.TestCase):
         self.assertEqual(deploy_parts.missing_entry_parts(record), ['节点来源', 'SSH 连接', '3x-ui 管理'])
         self.assertEqual(self.server.state['calls'], [])
         self.cli(['edit', identity], ['1', 'New name'])
-        self.cli(['edit', identity], ['6', 'y'])
+        self.cli(['edit', identity], ['5', 'y'])
         after = self.registry().records[identity]
         self.assertEqual(after['node_name'], 'New name')
         self.assertTrue(after['residential'])
         self.assertEqual(self.server.state['calls'], [])
 
     def test_tui_add_can_leave_source_unset(self):
-        self.cli(['add'], ['4', 'Only metadata', 'n'])
+        self.cli(['add'], ['5', 'Only metadata', 'n'])
         _, record = self.record('Only metadata')
         self.assertFalse(deploy_parts.has_source(record))
 
-    def test_local_only_config_can_be_enabled_tagged_and_later_gain_a_source(self):
-        identity, _ = self.partial()
-        self.cli(['edit', identity], ['3', '7903', node_fixtures.SOCKS])
-        before = self.registry().records[identity]
-        self.assertIsNone(before['remote_node_id'])
-        self.assertEqual(before['local_source'], 'custom')
+    def test_local_node_requires_source_before_it_can_be_enabled(self):
+        identity, before = self.partial()
         config = self.path.read_bytes()
-        self.cli(['edit', identity], ['6', 'y'])
+        with self.assertRaisesRegex(DeployError, '请先补全节点来源'):
+            self.cli(['edit', identity], ['3'])
+        self.assertEqual(self.registry().records[identity], before)
+        self.assertFalse(self.server.state['calls'])
+        with self.assertRaisesRegex(DeployError, '请先补全节点来源'):
+            self.cli(['edit', identity, '--local-port', '7903'])
+        self.assertFalse(self.server.state['nodes'])
+        self.assertEqual(self.path.read_bytes(), config)
+        self.cli(['edit', identity, '--fresh', '--node-link', node_fixtures.VLESS])
+        self.cli(['edit', identity], ['3', '7903'])
+        self.cli(['edit', identity], ['5', 'y'])
+        before = self.registry().records[identity]
         self.assertIn('家宽', self.server.state['tags'][before['local_node_id']])
-        self.cli(['edit', identity, '--node-link', node_fixtures.VLESS])
+        self.cli(['edit', identity, '--node-link', node_fixtures.SOCKS])
         after = self.registry().records[identity]
         self.assertIsNotNone(after['remote_node_id'])
         self.assertEqual(after['local_node_id'], before['local_node_id'])
         self.assertEqual(after['local_port'], 7903)
-        self.assertEqual(after['local_source'], 'custom')
-        self.assertEqual(self.path.read_bytes(), config)
+        outbound = json.loads(self.path.read_bytes())['outbounds'][-1]
+        self.assertEqual({k: v for k, v in outbound.items() if k != 'tag'}, parse_node_link(node_fixtures.SOCKS).outbound())
         self.assertIn('家宽', self.server.state['tags'][after['remote_node_id']])
 
     def test_ssh_part_does_not_require_a_node_source_or_install_runtime(self):
@@ -137,6 +146,36 @@ class ConfigurationPartTests(unittest.TestCase):
         self.assertEqual(saved['api_token'], 'private-api-token-123456789')
         self.assertEqual(Credentials(self.registry().state).panel_path(identity).stat().st_mode & 0o777, 0o600)
         secret.assert_called_once()
+
+    def test_project_binding_reverifies_legacy_hash_with_mihomo_hint(self):
+        identity, before = self.add('Project entry', node_fixtures.VLESS)
+        exported_link = node_fixtures.VLESS.replace('#Remote', '&spx=%2F&support-x25519mlkem768=true#Remote')
+        registry = self.registry()
+        binding = {'target': 'entry.example', 'port': 22, 'identity': None, 'password': False}
+        registry.update(identity, ssh=binding, server={'backend': 'project', 'identity': SERVER_ID,
+                        'fingerprint': parse_node_link(exported_link).fingerprint})
+        # Resume the existing server-part draft, as after a failed relay binding.
+        draft = deploy_parts.PartInput(registry, identity, 'server')
+        draft.capture(ssh_target=binding['target'], ssh_port=22, ssh_identity=None, ssh_password=False)
+        nodes_before = copy.deepcopy(self.server.state['nodes'])
+        calls, secret, _ = self.part_cli(identity, 'server', ['1'],
+            project_export={'INSTALLATION_ID': SERVER_ID, 'VLESS_URI': exported_link})
+        after = self.registry().records[identity]
+        self.assertEqual(after['server'], {'backend': 'project', 'identity': SERVER_ID,
+                         'fingerprint': parse_node_link(node_fixtures.VLESS).server_fingerprint})
+        self.assertEqual(after['remote_node_id'], before['remote_node_id'])
+        self.assertEqual(self.server.state['nodes'], nodes_before)
+        self.assertEqual(calls, [])
+        secret.assert_not_called()
+        self.assertFalse(draft.path.exists())
+
+    def test_project_binding_still_rejects_changed_connection(self):
+        identity, _ = self.add('Project entry', node_fixtures.VLESS)
+        exported_link = node_fixtures.VLESS.replace(':443', ':8443').replace('#Remote', '&support-x25519mlkem768=true#Remote')
+        with self.assertRaisesRegex(DeployError, '导出的节点与选中节点不一致'):
+            self.part_cli(identity, 'server', ['entry.example', '', 'n', ''],
+                project_export={'INSTALLATION_ID': SERVER_ID, 'VLESS_URI': exported_link})
+        self.assertIsNone(self.registry().records[identity]['server'])
 
     def test_failed_server_part_keeps_ssh_and_resumes_without_reentering_token(self):
         identity, _ = self.add('Entry', node_fixtures.VLESS)
@@ -257,7 +296,7 @@ class ConfigurationPartTests(unittest.TestCase):
             self.cli(['edit', identity, '--part', 'source'], ['2', 'https://subscription.example/path', 'n'])
         registry = self.registry()
         airport_id = registry.records[identity]['airport_id']
-        self.server.state['nodes'].append(dict(fixtures.SS_TEMPLATE, ID=501, Name='[SM]Pending',
+        self.server.state['nodes'].append(dict(fixtures.LOCAL_TEMPLATE, ID=501, Name='[SM]Pending',
             Protocol='vless', SourceID=airport_id, Source='airport', Link=node_fixtures.VLESS))
         self.cli(['edit', identity], ['1', 'New node name'])
         self.assertEqual(self.node(501)['SourceID'], airport_id)
@@ -265,7 +304,7 @@ class ConfigurationPartTests(unittest.TestCase):
         self.assertEqual(self.node(501)['Name'], '[SM]New node name')
         self.cli(['edit', identity], ['3', '7904'])
         before = self.registry().records[identity]
-        self.cli(['edit', identity], ['9', 'New airport name'])
+        self.cli(['edit', identity], ['8', 'New airport name'])
         after = self.registry().records[identity]
         self.assertEqual(after['airport_id'], airport_id)
         self.assertEqual(after['local_node_id'], before['local_node_id'])

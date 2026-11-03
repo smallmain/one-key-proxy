@@ -112,6 +112,35 @@ write_latest_resolver_installer_fixture() {
   chmod 0600 "$destination"
 }
 
+write_checksum_installer_fixture() {
+  local destination=$1 base="${1}.base"
+  write_latest_resolver_installer_fixture "$base"
+  awk -v helpers="$PROJECT_ROOT/tests/fixtures/xui-v3.10.2-verifiers.txt" '
+    /^install_x-ui\(\) \{/ {
+      while ((getline line < helpers) > 0) print line
+      close(helpers)
+    }
+    /^  local xui_script_temp=/ {
+      print "  local script_ref=\"${tag_version}\""
+      print "  if [[ \"${tag_version}\" == \"dev-latest\" ]]; then"
+      print "    script_ref=\"main\""
+      print "  fi"
+      print "  local required_files=(\"x-ui.sh\")"
+      print "  require_repo_files \"${script_ref}\" \"${required_files[@]}\""
+    }
+    { gsub(/main\//, "${script_ref}/"); print }
+    /^    curl -fLR / {
+      if (index($0, "${url}") != 0) {
+        print "    verify_release_checksum \"${url}\" \"${xui_folder}-linux-$(arch).tar.gz\""
+      } else {
+        print "    verify_release_checksum \"https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz\" \"${xui_folder}-linux-$(arch).tar.gz\""
+      }
+    }
+  ' "$base" >"$destination"
+  rm -f "$base"
+  chmod 0600 "$destination"
+}
+
 replace_fixture_literal() {
   local source=$1 destination=$2 needle=$3 replacement=$4
   awk -v needle="$needle" -v replacement="$replacement" '
@@ -225,6 +254,30 @@ test_latest_resolver_does_not_relax_download_guards() {
     END { while ((getline line < resolver) > 0) print line }
   ' "$valid" >"$mutated"
   assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.7.0 "$ARCH"
+}
+
+test_installer_accepts_checksum_and_versioned_helpers() {
+  local installer=$TEST_SANDBOX/installer-checksum.sh
+  write_checksum_installer_fixture "$installer"
+  assert_success okp_xui_validate_pinned_installer_downloaders "$installer" "$REPOSITORY" v3.10.2 amd64
+  assert_success okp_xui_validate_pinned_installer_downloaders "$installer" "$REPOSITORY" v3.10.2 arm64
+}
+
+test_checksum_and_versioned_helpers_preserve_guards() {
+  local valid=$TEST_SANDBOX/installer-checksum-valid.sh mutated=$TEST_SANDBOX/installer-checksum-mutated.sh
+  write_checksum_installer_fixture "$valid"
+  replace_fixture_literal "$valid" "$mutated" '"${url}.sha256"' '"https://attacker.invalid/checksum"'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.10.2 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" 'sums="$2.sha256"' 'sums="/usr/bin/x-ui"'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.10.2 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" 'local script_ref="${tag_version}"' 'local script_ref="main"'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.10.2 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" '/${ref}/${name}' '/main/${name}'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.10.2 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" '-sIL --retry' '-skIL --retry'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.10.2 "$ARCH"
+  replace_fixture_literal "$valid" "$mutated" 'verify_release_checksum "${url}"' 'verify_release_checksum "https://attacker.invalid/asset"'
+  assert_failure okp_xui_validate_pinned_installer_downloaders "$mutated" "$REPOSITORY" v3.10.2 "$ARCH"
 }
 
 test_installer_downloader_shape_rejects_bypasses() {
@@ -374,6 +427,49 @@ test_pinned_wrapper_copies_asset_and_rewrites_main() {
   PATH=$ORIGINAL_PATH
 }
 
+test_wrapper_supports_audited_checksum_and_repo_probes() {
+  local workdir=$TEST_SANDBOX/prepared-checksum output_dir=$TEST_SANDBOX/checksum-output
+  local output_file result status red='' yellow='' green='' plain=''
+  prepare_fixture
+  mkdir -p "$workdir" "$output_dir"
+  output_file=$output_dir/$ASSET_NAME
+  assert_success okp_prepare_pinned_xui_download "$REPOSITORY" "$TAG" "$COMMIT" \
+    "$ARCH" "$FIXTURE_DIGEST" "$workdir" "$output_file" "$output_dir"
+  : >"$FAKE_CURL_AUDIT"
+  PATH="${workdir}/bin:${PATH}"
+  source "$PROJECT_ROOT/tests/fixtures/xui-v3.10.2-verifiers.txt"
+  if ! have_command sha256sum; then
+    sha256sum() { shasum -a 256 "$@"; }
+  fi
+  assert_success curl -fLR -o "$output_file" "$ASSET_URL"
+  result=$(curl -sL -o "$output_file.sha256" -w '%{http_code}' "$ASSET_URL.sha256") || return 1
+  assert_eq 200 "$result"
+  assert_eq "$FIXTURE_DIGEST" "$(awk '{print $1}' "$output_file.sha256")"
+  assert_eq 600 "$(file_mode "$output_file.sha256")"
+  assert_success verify_release_checksum "$ASSET_URL" "$output_file"
+  assert_success require_repo_files "$TAG" x-ui.sh x-ui.rc
+  assert_success curl -fLRo "$output_dir/x-ui-temp.$$" "https://raw.githubusercontent.com/${REPOSITORY}/${TAG}/x-ui.sh"
+  cmp "$FAKE_CURL_PAYLOAD" "$output_dir/x-ui-temp.$$"
+  assert_eq '' "$(<"$FAKE_CURL_AUDIT")" 'checksum and pinned helpers must not reach real curl'
+  assert_failure curl -o "$output_dir/other.sha256" "$ASSET_URL.sha256"
+  assert_failure curl -o "$output_file.sha256" "https://attacker.invalid/checksum"
+  assert_failure curl -o "$output_file.sha256" "$ASSET_URL.sha256" --url "$ASSET_URL"
+  assert_failure curl -sIL -o /dev/null -w '%{http_code}' "https://raw.githubusercontent.com/${REPOSITORY}/dev/x-ui.sh"
+  assert_failure curl -sIL -o "$output_file" -w '%{http_code}' "https://raw.githubusercontent.com/${REPOSITORY}/${TAG}/x-ui.sh"
+  printf 'tampered\n' >"$output_file"
+  status=0
+  (verify_release_checksum "$ASSET_URL" "$output_file") || status=$?
+  [[ $status != 0 ]] || fail 'checksum verifier accepted a modified archive'
+  assert_file_not_exists "$output_file"
+  assert_eq '' "$(<"$FAKE_CURL_AUDIT")" 'rejected requests must not reach real curl'
+  printf 'tampered\n' >"$OKP_XUI_VERIFIED_ASSET.sha256"
+  assert_failure curl -o "$output_file.sha256" -w '%{http_code}' "$ASSET_URL.sha256"
+  assert_file_not_exists "$output_file.sha256"
+  assert_success curl -s -w $'\n%{http_code}' --max-time 3 https://example.invalid/ip
+  assert_contains "$(<"$FAKE_CURL_AUDIT")" 'https://example.invalid/ip'
+  PATH=$ORIGINAL_PATH
+}
+
 run_test 'release metadata selects one exact asset with SHA-256' \
   test_release_metadata_requires_one_exact_digested_asset
 run_test 'installer downloader shape accepts the pinned curl contract' \
@@ -384,6 +480,10 @@ run_test 'v3.7.0 latest-tag resolver is compatible with pinned downloads' \
   test_installer_downloader_shape_accepts_latest_resolver
 run_test 'v3.7.0 resolver support preserves download guards' \
   test_latest_resolver_does_not_relax_download_guards
+run_test 'checksum verification and versioned helper downloads are compatible' \
+  test_installer_accepts_checksum_and_versioned_helpers
+run_test 'checksum and versioned helper support preserves download guards' \
+  test_checksum_and_versioned_helpers_preserve_guards
 run_test 'installer downloader shape rejects curl and wget bypasses' \
   test_installer_downloader_shape_rejects_bypasses
 run_test 'installer downloader shape rejects changed resources' \
@@ -392,5 +492,7 @@ run_test 'verified release preparation rejects a wrong digest' \
   test_prepare_rejects_wrong_download_digest
 run_test 'pinned curl wrapper copies and rewrites securely' \
   test_pinned_wrapper_copies_asset_and_rewrites_main
+run_test 'pinned curl wrapper serves audited checksum and repository probes' \
+  test_wrapper_supports_audited_checksum_and_repo_probes
 
 finish_tests

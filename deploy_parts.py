@@ -51,7 +51,7 @@ class PartInput:
     fields = {'ssh_target': str, 'ssh_port': int, 'ssh_identity': str, 'ssh_password': bool,
               'panel_url': str, 'api_token': str, 'source_link': str,
               'subscription_url': str, 'insecure_subscription': bool, 'subscription_node': str, 'previous_url': str}
-    fields.update(source_type=str, local_port=int, local_link=str)
+    fields.update(source_type=str, local_port=int)
 
     def __init__(self, registry, identity, part, on_ssh=None):
         self.registry, self.identity, self.part = registry, identity, part
@@ -280,7 +280,7 @@ def complete_part(registry, identity, client, args, part, *, seed=None, on_ssh=N
                 if len(nodes) != 1:
                     raise DeployError('服务器管理需要唯一的入口节点，请先明确节点来源。')
                 link = parse_node_link(nodes[0]['Link'])
-                link.outbound()
+                fingerprint = link.server_fingerprint
                 if server and server['backend'] == 'standalone':
                     from deploy_panels import retry_after_update
                     exported = retry_after_update(ssh, lambda: agent_call(ssh, identity, server, {'operation': 'export'}) if part == 'ssh'
@@ -304,10 +304,10 @@ def complete_part(registry, identity, client, args, part, *, seed=None, on_ssh=N
                     raise DeployError('服务器管理身份无效。')
                 if server and (server['identity'] != server_id or server['backend'] != backend):
                     raise DeployError('新的 SSH 地址不是原入口安装，拒绝重新绑定。')
-                if parse_node_link(exported['VLESS_URI']).fingerprint != link.fingerprint:
+                if parse_node_link(exported['VLESS_URI']).server_fingerprint != fingerprint:
                     raise DeployError('SSH 服务器导出的节点与选中节点不一致。')
                 registry.update(identity, ssh=binding,
-                                server={'backend': backend, 'identity': server_id, 'fingerprint': link.fingerprint})
+                                server={'backend': backend, 'identity': server_id, 'fingerprint': fingerprint})
                 if backend == 'standalone' and all(key in draft.values for key in ('panel_url', 'api_token')):
                     from deploy_credentials import Credentials
                     Credentials(registry.state).save_panel(identity, registry.records[identity]['server'], draft.values)
@@ -327,13 +327,15 @@ def ensure_entry(registry, identity, client, args, *, creation=None):
     from deploy import prompt_text
     missing = missing_entry_parts(registry.records[identity])
     server = registry.records[identity]['server']
-    if server and has_source(registry.records[identity]) and not any(
-            parse_node_link(node['Link']).fingerprint == server['fingerprint']
-            for node in client.remote_nodes(identity, registry.records[identity])):
-        missing.append('3x-ui 管理（节点来源已变化）')
+    changed = server and has_source(registry.records[identity]) and not any(
+        parse_node_link(node['Link']).server_fingerprint == server['fingerprint']
+        for node in client.remote_nodes(identity, registry.records[identity]))
     seed = creation.values if creation else None
     if missing:
         print('入口缺少：' + '、'.join(missing))
+    if changed:
+        print('入口节点链接与保存的管理绑定不一致，需要通过 SSH 重新核验。')
+    if missing or changed:
         if not sys.stdin.isatty():
             raise DeployError('请从此配置的编辑菜单补全所需配置后重试。')
         print('  1. 补全所需配置并继续\n  0. 返回')
@@ -409,7 +411,7 @@ def edit_part(registry, identity, client, args, part):
     if 'insecure_subscription' not in draft.values:
         draft.capture(insecure_subscription=prompt_yes_no('订阅是否使用自签名证书', bool(airport and airport.get('skipTLSVerify'))))
     config = read_env(record['env_file'])
-    local = bool(record['singbox'] and record['local_source'] == 'remote')
+    local = bool(record['singbox'])
     old_setting = client.create_local_node
     try:
         exported = subscription_export(draft.values['subscription_url'], client.url, local=local,

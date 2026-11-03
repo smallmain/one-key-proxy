@@ -239,6 +239,8 @@ okp_xui_validate_pinned_installer_downloaders() {
   local asset_template asset_output direct_asset_output variable_download
   local raw_prefix raw_total expected_total count
   local xui_script_url xui_rc_url service_url latest_resolver
+  local checksum_helper repo_probe_helper checksum_enabled=false release_url_count=2 variable_url_count=1
+  local raw_ref=main
   local -a service_urls
 
   _okp_xui_validate_release_identity "$repository" "$tag" '' "$architecture" || {
@@ -289,6 +291,73 @@ OKP_XUI_LATEST_RESOLVER
     }
     code=${code/"$latest_resolver"/}
   fi
+  if [[ $code == *verify_release_checksum* ]]; then
+    checksum_helper=$(cat <<'OKP_XUI_CHECKSUM_HELPER'
+verify_release_checksum() {
+    local url="$1" file="$2" sums="$2.sha256" code expected actual
+    rm -f "${sums}"
+    code=$(curl -sL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 60 -o "${sums}" -w '%{http_code}' "${url}.sha256")
+    if [[ "${code}" == "404" ]]; then
+        rm -f "${sums}"
+        echo -e "${yellow}No checksum published for this release, skipping verification${plain}"
+        return 0
+    fi
+    if [[ "${code}" != "200" ]]; then
+        rm -f "${sums}" "${file}"
+        echo -e "${red}Failed to download the checksum for $(basename "${file}") (HTTP ${code})${plain}"
+        exit 1
+    fi
+    expected=$(awk 'NR == 1 {print $1}' "${sums}")
+    actual=$(sha256sum "${file}" | awk '{print $1}')
+    rm -f "${sums}"
+    if [[ ! "${expected}" =~ ^[0-9a-f]{64}$ || "${expected}" != "${actual}" ]]; then
+        rm -f "${file}"
+        echo -e "${red}Checksum mismatch for $(basename "${file}"): expected ${expected:-<none>}, got ${actual}${plain}"
+        exit 1
+    fi
+    echo -e "${green}Checksum verified: ${actual}${plain}"
+}
+OKP_XUI_CHECKSUM_HELPER
+    ) || return 1
+    [[ $code == *"$checksum_helper"* &&
+      $(_okp_xui_count_literal "$code" verify_release_checksum) == 3 ]] || {
+      log_error '固定的 3x-ui 安装器 SHA-256 校验方式已改变。'
+      return 1
+    }
+    code=${code/"$checksum_helper"/}
+    checksum_enabled=true
+    release_url_count=3
+    variable_url_count=2
+  fi
+  if [[ $code == *require_repo_files* ]]; then
+    repo_probe_helper=$(cat <<'OKP_XUI_REPO_PROBE_HELPER'
+require_repo_files() {
+    local ref="$1" name status
+    shift
+    [[ "${ref}" == "main" ]] && return 0
+    for name in "$@"; do
+        status=$(curl -sIL --retry 3 --connect-timeout 15 -o /dev/null -w '%{http_code}' "https://raw.githubusercontent.com/MHSanaei/3x-ui/${ref}/${name}")
+        if [[ "${status}" != "200" ]]; then
+            echo -e "${red}${name} is not available for ${ref} (HTTP ${status})${plain}"
+            echo -e "${red}Install a release that ships it, or 'dev' for the rolling build. Your existing installation has not been touched.${plain}"
+            exit 1
+        fi
+    done
+}
+OKP_XUI_REPO_PROBE_HELPER
+    ) || return 1
+    [[ $code == *"$repo_probe_helper"* &&
+      $(_okp_xui_count_literal "$code" require_repo_files) == 2 &&
+      $(_okp_xui_count_literal "$code" 'require_repo_files "${script_ref}" "${required_files[@]}"') == 1 &&
+      $(_okp_xui_count_literal "$code" 'local script_ref="${tag_version}"') == 1 &&
+      $(_okp_xui_count_assignment "$code" script_ref) == 1 &&
+      $(_okp_xui_count_literal "$code" 'script_ref="main"') == 1 ]] || {
+      log_error '固定的 3x-ui 安装器版本辅助文件查询方式已改变。'
+      return 1
+    }
+    code=${code/"$repo_probe_helper"/}
+    raw_ref='${script_ref}'
+  fi
   [[ $(_okp_xui_count_bare_curl_with "$code" '') == 7 &&
     $(_okp_xui_count_bare_curl_with "$code" 'curl -s https://get.acme.sh | sh') == 2 ]] || {
     log_error '固定的 3x-ui 安装器裸 curl 命令集合已改变。'
@@ -327,26 +396,33 @@ OKP_XUI_LATEST_RESOLVER
     return 1
   }
   count=$(_okp_xui_count_literal "$code" "https://github.com/${repository}/releases/download/")
-  [[ $count == 2 && $count == "$(_okp_xui_count_literal "$code" "$asset_template")" &&
+  [[ $count == "$release_url_count" && $count == "$(_okp_xui_count_literal "$code" "$asset_template")" &&
     $(_okp_xui_count_bare_curl_with "$code" "$asset_template") == 1 &&
     $(_okp_xui_count_bare_curl_with "$code" "$direct_asset_output") == 1 ]] || {
     log_error '固定的 3x-ui 安装器包含非预期的 release 下载 URL。'
     return 1
   }
   variable_download=$(_okp_xui_count_bare_curl_with "$code" '${url}')
-  [[ $variable_download == 1 && $(_okp_xui_count_literal "$code" '${url}') == 1 &&
+  [[ $variable_download == 1 && $(_okp_xui_count_literal "$code" '${url}') == "$variable_url_count" &&
     $(_okp_xui_count_bare_curl_with "$code" "$asset_output") == 1 ]] || {
     log_error '固定的 3x-ui 安装器 release 资产未通过 PATH curl 下载到固定输出。'
     return 1
   }
+  if [[ $checksum_enabled == true ]]; then
+    [[ $(_okp_xui_count_literal "$code" "verify_release_checksum \"${asset_template}\" \"\${xui_folder}-linux-\$(arch).tar.gz\"") == 1 &&
+      $(_okp_xui_count_literal "$code" 'verify_release_checksum "${url}" "${xui_folder}-linux-$(arch).tar.gz"') == 1 ]] || {
+      log_error '固定的 3x-ui 安装器 SHA-256 校验目标已改变。'
+      return 1
+    }
+  fi
 
   raw_prefix="https://raw.githubusercontent.com/${repository}/"
-  xui_script_url="${raw_prefix}main/x-ui.sh"
-  xui_rc_url="${raw_prefix}main/x-ui.rc"
+  xui_script_url="${raw_prefix}${raw_ref}/x-ui.sh"
+  xui_rc_url="${raw_prefix}${raw_ref}/x-ui.rc"
   service_urls=(
-    "${raw_prefix}main/x-ui.service.debian"
-    "${raw_prefix}main/x-ui.service.arch"
-    "${raw_prefix}main/x-ui.service.rhel"
+    "${raw_prefix}${raw_ref}/x-ui.service.debian"
+    "${raw_prefix}${raw_ref}/x-ui.service.arch"
+    "${raw_prefix}${raw_ref}/x-ui.service.rhel"
   )
   [[ $(_okp_xui_count_literal "$code" "$xui_script_url") == 1 &&
     $(_okp_xui_count_literal "$code" "$xui_rc_url") == 1 &&
@@ -404,6 +480,15 @@ _okp_xui_write_curl_wrapper() {
   local raw_xui_script raw_xui_script_digest raw_xui_rc raw_xui_rc_digest
   local raw_service_debian raw_service_debian_digest raw_service_arch raw_service_arch_digest
   local raw_service_rhel raw_service_rhel_digest
+  local verified_checksum="${verified_asset}.sha256" checksum_digest release_tag raw_tag_prefix
+
+  release_tag=${asset_url%/*}
+  release_tag=${release_tag##*/}
+  raw_tag_prefix="${raw_main_prefix%main/}${release_tag}/"
+  # The sidecar uses the release metadata digest already verified by this project.
+  printf '%s  %s\n' "$expected_digest" "${expected_output##*/}" >"$verified_checksum" || return 1
+  chmod 0600 "$verified_checksum" || return 1
+  checksum_digest=$(_okp_xui_sha256_file "$verified_checksum") || return 1
 
   raw_cache_dir="${verified_asset%/*}/raw"
   raw_xui_script="${raw_cache_dir}/x-ui.sh"
@@ -433,7 +518,10 @@ _okp_xui_write_curl_wrapper() {
     printf 'VERIFIED_ASSET=%q\n' "$verified_asset"
     printf 'EXPECTED_DIGEST=%q\n' "$expected_digest"
     printf 'RAW_MAIN_PREFIX=%q\n' "$raw_main_prefix"
+    printf 'RAW_TAG_PREFIX=%q\n' "$raw_tag_prefix"
     printf 'RAW_COMMIT_PREFIX=%q\n' "$raw_commit_prefix"
+    printf 'VERIFIED_CHECKSUM=%q\n' "$verified_checksum"
+    printf 'CHECKSUM_DIGEST=%q\n' "$checksum_digest"
     printf 'RELEASE_PREFIX=%q\n' "${asset_url%%/releases/download/*}/releases/download/"
     printf 'RAW_REPOSITORY_PREFIX=%q\n' "${raw_main_prefix%main/}"
     printf 'RAW_XUI_SCRIPT=%q\n' "$raw_xui_script"
@@ -492,10 +580,14 @@ matches_numbered_output() {
 
 declare -a rewritten=()
 asset_requests=0
+checksum_requests=0
 raw_requests=0
 output=''
 output_count=0
 expect_output=false
+expect_write_out=false
+write_out=''
+head_request=false
 raw_source=''
 raw_digest=''
 raw_output_prefix=''
@@ -512,6 +604,17 @@ for argument in "$@"; do
   if [[ $argument =~ ^-[A-Za-z]*k[A-Za-z]*$ ]]; then
     printf '%s\n' 'one-key-proxy curl wrapper: 拒绝 curl insecure 短选项' >&2
     exit 64
+  fi
+  if [[ $expect_write_out == true ]]; then
+    write_out=$argument
+    expect_write_out=false
+  else
+    case $argument in
+      -w|--write-out) expect_write_out=true ;;
+      --write-out=*) write_out=${argument#--write-out=} ;;
+      -w?*) write_out=${argument#-w} ;;
+      -I|--head|-[A-Za-z]*I[A-Za-z]*) head_request=true ;;
+    esac
   fi
   if [[ $expect_output == true ]]; then
     output=$argument
@@ -531,7 +634,7 @@ for argument in "$@"; do
   raw_repository_prefix_lower=$(printf '%s' "$RAW_REPOSITORY_PREFIX" | tr '[:upper:]' '[:lower:]') || exit 1
   if [[ $argument_lower == *"$release_prefix_lower"* ]]; then
     case $argument in
-      "$ASSET_URL"|--url="$ASSET_URL") ;;
+      "$ASSET_URL"|--url="$ASSET_URL"|"$ASSET_URL.sha256"|--url="$ASSET_URL.sha256") ;;
       *)
         printf '%s\n' 'one-key-proxy curl wrapper: 拒绝未验证的官方 release 资产 URL' >&2
         exit 65
@@ -541,6 +644,11 @@ for argument in "$@"; do
   if [[ $argument == *"$RAW_MAIN_PREFIX"* ]]; then
     argument_before=${argument%%"$RAW_MAIN_PREFIX"*}
     argument_after=${argument#*"$RAW_MAIN_PREFIX"}
+    argument="${argument_before}${RAW_COMMIT_PREFIX}${argument_after}"
+  fi
+  if [[ $argument == *"$RAW_TAG_PREFIX"* ]]; then
+    argument_before=${argument%%"$RAW_TAG_PREFIX"*}
+    argument_after=${argument#*"$RAW_TAG_PREFIX"}
     argument="${argument_before}${RAW_COMMIT_PREFIX}${argument_after}"
   fi
   case $argument in
@@ -584,19 +692,32 @@ for argument in "$@"; do
   esac
   case $argument in
     "$ASSET_URL"|--url="$ASSET_URL") asset_requests=$((asset_requests + 1)) ;;
+    "$ASSET_URL.sha256"|--url="$ASSET_URL.sha256") checksum_requests=$((checksum_requests + 1)) ;;
   esac
   rewritten+=("$argument")
 done
-[[ $expect_output == false ]] || {
-  printf '%s\n' 'one-key-proxy curl wrapper: --output 缺少目标路径' >&2
+[[ $expect_output == false && $expect_write_out == false ]] || {
+  printf '%s\n' 'one-key-proxy curl wrapper: 输出参数缺少值' >&2
   exit 64
 }
+if ((asset_requests + checksum_requests + raw_requests != 0)); then
+  [[ -z $write_out || $write_out == '%{http_code}' ]] || exit 64
+fi
+
+if ((checksum_requests != 0)); then
+  ((checksum_requests == 1 && asset_requests == 0 && raw_requests == 0 && output_count == 1)) || exit 64
+  [[ $head_request == false && $output == "$EXPECTED_OUTPUT.sha256" ]] || exit 64
+  copy_verified_file "$VERIFIED_CHECKSUM" "$CHECKSUM_DIGEST" "$output" || exit $?
+  [[ -z $write_out ]] || printf '200'
+  exit 0
+fi
 
 if ((asset_requests != 0)); then
   ((asset_requests == 1 && raw_requests == 0 && output_count == 1)) || {
     printf '%s\n' 'one-key-proxy curl wrapper: release 资产 URL 出现次数异常' >&2
     exit 64
   }
+  [[ $head_request == false ]] || exit 64
   [[ $output == "$EXPECTED_OUTPUT" ]] || {
     printf '%s\n' 'one-key-proxy curl wrapper: release 资产输出路径与固定目标不一致' >&2
     exit 64
@@ -606,6 +727,7 @@ if ((asset_requests != 0)); then
     printf '%s\n' 'one-key-proxy curl wrapper: 无法复制已验证 release 资产' >&2
     exit "$copy_status"
   }
+  [[ -z $write_out ]] || printf '200'
   exit 0
 fi
 
@@ -614,6 +736,11 @@ if ((raw_requests != 0)); then
     printf '%s\n' 'one-key-proxy curl wrapper: raw helper 请求或输出次数异常' >&2
     exit 64
   }
+  if [[ $head_request == true ]]; then
+    [[ $output == /dev/null && $(sha256_file "$raw_source") == "$raw_digest" ]] || exit 65
+    [[ -z $write_out ]] || printf '200'
+    exit 0
+  fi
   matches_numbered_output "$output" "$raw_output_prefix" || {
     printf '%s\n' 'one-key-proxy curl wrapper: raw helper 输出路径与 allowlist 不一致' >&2
     exit 64
@@ -623,10 +750,11 @@ if ((raw_requests != 0)); then
     printf '%s\n' 'one-key-proxy curl wrapper: 无法复制固定 commit 的 raw helper' >&2
     exit "$copy_status"
   }
+  [[ -z $write_out ]] || printf '200'
   exit 0
 fi
 
-if [[ $output == "$EXPECTED_OUTPUT" ]] ||
+if [[ $output == "$EXPECTED_OUTPUT" || $output == "$EXPECTED_OUTPUT.sha256" ]] ||
   matches_numbered_output "$output" "$RAW_XUI_OUTPUT_PREFIX" ||
   matches_numbered_output "$output" "$RAW_RC_OUTPUT_PREFIX" ||
   matches_numbered_output "$output" "$RAW_SERVICE_OUTPUT_PREFIX"; then

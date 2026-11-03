@@ -280,6 +280,8 @@ test_nat_defaults_and_env_maps_accept_external_only() {
   assert_eq 2053 "$PANEL_INTERNAL_PORT"
   assert_eq 443 "$NODE_INTERNAL_PORT"
   assert_eq 2096 "$SUB_INTERNAL_PORT"
+  assert_eq www.tencentcloud.com:443 "$REALITY_TARGET"
+  assert_eq www.tencentcloud.com "$REALITY_SNI"
   OKP_PANEL_MAP=56664
   OKP_NODE_MAP=56665
   OKP_SUB_MAP=56666

@@ -145,7 +145,7 @@ def ssh_call(entry, request):
                 information = recover_pending(ssh, run_helper(ssh, {'operation': 'panel-info'}))
             exported = export_node(ssh)
             if (exported["INSTALLATION_ID"].lower() != server["identity"]
-                    or parse_node_link(exported["VLESS_URI"]).fingerprint != server["fingerprint"]):
+                    or parse_node_link(exported["VLESS_URI"]).server_fingerprint != server["fingerprint"]):
                 raise DeployError("SSH 目标与已绑定的入口安装身份不一致。")
             if request['operation'] != 'delete':
                 preflight(ssh, information)
@@ -181,7 +181,7 @@ class RemoteRelayManager:
         try:
             entry = self.registry.records[entry_id]
             if request['operation'] != 'delete' and entry['server'] and not any(
-                    parse_node_link(node['Link']).fingerprint == entry['server']['fingerprint']
+                    parse_node_link(node['Link']).server_fingerprint == entry['server']['fingerprint']
                     for node in self.client.remote_nodes(entry_id, entry)):
                 raise DeployError('入口节点来源与服务器管理配置不一致，请先补全或修正入口的 3x-ui 管理。')
             result = self.transport(self.registry.records[entry_id], dict(request, entry_id=entry_id))
@@ -384,7 +384,7 @@ class RemoteRelayManager:
             journal = nodes.prepare(identity, link=link.link, name=intent["name"],
                                     local_action=intent["local_action"],
                                     local_port=intent["local_port"] if intent["local_action"] == "enable" else None,
-                                    same_local=intent["local_action"] == "enable", relay_id=None, intent=intent,
+                                    relay_id=None, intent=intent,
                                     residential=intent["residential"], auto_name=intent["auto_name"])
         else:
             self.call(intent["entry_id"], {"operation": "inspect", "identity": identity})
@@ -566,7 +566,7 @@ def create_remote(args, registry, identity, manager, config_path, config):
             if "enabled" not in values:
                 enabled = True if args.local_port is not None else args.create_local_node
                 if enabled is None:
-                    enabled = prompt_yes_no("是否启用这组远程中转的本地 SS", local_node_default(config)) if interactive else local_node_default(config)
+                    enabled = prompt_yes_no("是否启用这组远程中转的本地 SOCKS5", local_node_default(config)) if interactive else local_node_default(config)
                 creation.capture(enabled=enabled)
             if "local_port" not in values:
                 port = client.choose_local_port(args.local_port, interactive=interactive) if values["enabled"] else None
@@ -668,14 +668,14 @@ def manage_remote(args, env_override=False, *, registry=None, exit_id=None):
                 local_action = "enable"
                 local_port = client.choose_local_port(local_port, interactive=interactive)
             elif args.create_local_node is False:
-                if not interactive or not prompt_yes_no("确认删除这组中转的本地 SS 和 sing-box 资源", False):
+                if not interactive or not prompt_yes_no("确认删除这组中转的本地 SOCKS5 和 sing-box 资源", False):
                     raise DeployError("已取消关闭本地节点。")
                 local_action = "disable"
             elif exit_node is None and args.local_port is None and args.name is None and args.residential is None:
                 if not interactive:
                     manager.sync(identity, selection=args.subscription_node)
                     return
-                print("  1. 更换落地节点\n  2. 修改名称\n  3. 启用 / 修改本地 SS\n  4. 关闭本地 SS\n  5. 设置是否为家宽\n  0. 返回")
+                print("  1. 更换落地节点\n  2. 修改名称\n  3. 启用 / 修改本地 SOCKS5\n  4. 关闭本地 SOCKS5\n  5. 设置是否为家宽\n  0. 返回")
                 choice = prompt_text("请选择", "0")
                 if choice == "0":
                     return
@@ -697,7 +697,7 @@ def manage_remote(args, env_override=False, *, registry=None, exit_id=None):
                     local_action = "enable"
                     local_port = client.choose_local_port(default=record["local_port"], interactive=True, prompt=True)
                 elif choice == "4":
-                    if not prompt_yes_no("确认删除本地 SS 和 sing-box 资源，保留远程中转", False):
+                    if not prompt_yes_no("确认删除本地 SOCKS5 和 sing-box 资源，保留远程中转", False):
                         return
                     local_action = "disable"
                 else:

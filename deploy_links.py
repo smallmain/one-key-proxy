@@ -1,7 +1,7 @@
 """Structured URI handling for standalone proxy nodes."""
 
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import ipaddress
 import re
 import urllib.parse
@@ -39,8 +39,25 @@ class NodeLink:
             return digest(self.outbound())
         except DeployError:
             pass
+        return self.uri_fingerprint
+
+    @property
+    def uri_fingerprint(self):
         return digest({"protocol": self.protocol, "host": self.host, "port": self.port,
                        "auth": self.auth, "query": self.query})
+
+    @property
+    def server_fingerprint(self):
+        return digest(self.server_outbound())
+
+    def server_outbound(self):
+        query = dict(self.query)
+        hint = query.pop("support-x25519mlkem768", None)
+        if hint is not None and (self.protocol != "vless" or query.get("security") != "reality"
+                                 or hint not in ("true", "false", "1", "0")):
+            raise DeployError("support-x25519mlkem768 必须是 REALITY 节点的布尔提示参数。")
+        # Mihomo's client hint does not identify the server; keep it in the source URI.
+        return replace(self, query=query).outbound()
 
     def marked(self, identity):
         return urllib.parse.urlsplit(self.link)._replace(fragment="okp-remote:" + identity).geturl()
@@ -112,15 +129,17 @@ class NodeLink:
             return dict(result, version="5", **self.auth)
         if self.protocol == "ss":
             if self.query:
-                raise DeployError("本地 Shadowsocks 暂不支持 plugin 等扩展参数；可指定另一条本地出站链接。")
+                raise DeployError("本地 Shadowsocks 暂不支持 plugin 等扩展参数；可关闭本地节点后添加。")
             return dict(result, **self.auth)
         q = self.query
         allowed = {"type", "security", "encryption", "flow", "sni", "fp", "pbk", "sid", "alpn",
-                   "allowInsecure", "path", "host", "serviceName", "spx"}
+                   "allowInsecure", "path", "host", "serviceName", "spx", "headerType"}
         if set(q) - allowed:
-            raise DeployError("VLESS 链接包含本地转换尚不支持的参数，请使用受支持的本地出站链接。")
+            raise DeployError("VLESS 链接包含本地转换尚不支持的参数；可关闭本地节点后添加。")
         # sing-box has no Xray crawler setting; retain the REALITY authentication fields.
         self.reality_spider()
+        if q.get("headerType", "none") != "none":
+            raise DeployError("本地 VLESS 暂不支持 headerType 伪装；可关闭本地节点后添加。")
         transport, security, flow = q.get("type", "tcp"), q.get("security", "none"), q.get("flow", "")
         if (transport not in ("tcp", "ws", "grpc") or security not in ("none", "tls", "reality")
                 or q.get("encryption", "none") != "none" or flow not in ("", "xtls-rprx-vision")
@@ -187,7 +206,8 @@ def parse_node_link(raw):
             host = host.encode("idna").decode().lower()
             if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host):
                 raise ValueError
-        pairs = urllib.parse.parse_qsl(uri.query, keep_blank_values=True, strict_parsing=True, errors="strict")
+        pairs = (urllib.parse.parse_qsl(uri.query, keep_blank_values=True, strict_parsing=True, errors="strict")
+                 if uri.query else [])
         if len({key for key, _ in pairs}) != len(pairs):
             raise ValueError
         query = dict(pairs)

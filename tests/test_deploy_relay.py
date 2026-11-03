@@ -8,6 +8,7 @@ import tempfile
 import sys
 from types import SimpleNamespace
 import unittest
+import urllib.parse
 import uuid
 from unittest.mock import patch
 
@@ -144,6 +145,19 @@ class FakeXui:
 
 
 class ServerRelayTests(unittest.TestCase):
+    def test_api_failure_identifies_endpoint_without_echoing_credentials(self):
+        for error, reason in ((b'3x-ui API returned HTTP 403 for a POST request private-secret', 'HTTP 403'),
+                              (b'3x-ui API transport failed for a POST request private-secret', 'transport'),
+                              (b'curl: (28) private-secret\n3x-ui API transport failed for a POST request', 'transport curl 28'),
+                              (b'3x-ui rejected a POST request: private-secret', 'request')):
+            result = SimpleNamespace(returncode=1, stdout=b'private-secret', stderr=error)
+            with patch.object(server_module.subprocess, 'run', return_value=result), \
+                    self.assertRaises(server_module.RelayError) as failure:
+                server_module.api('POST', '/panel/api/clients/del/private-secret')
+            self.assertIn('/panel/api/clients/del/<client>', str(failure.exception))
+            self.assertIn('(' + reason + ')', str(failure.exception))
+            self.assertNotIn('private-secret', str(failure.exception))
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -374,7 +388,7 @@ class RemotePublicationTests(unittest.TestCase):
     def complete_entry(self, registry, identity=ENTRY):
         link = parse_node_link(VLESS.replace(parse_node_link(VLESS).auth['uuid'], str(uuid.UUID(identity))))
         node_id = max([917] + [n['ID'] for n in self.server.state['nodes']]) + 1
-        self.server.state['nodes'].append(dict(fixtures.SS_TEMPLATE, ID=node_id, Protocol='vless',
+        self.server.state['nodes'].append(dict(fixtures.LOCAL_TEMPLATE, ID=node_id, Protocol='vless',
             Name='[SM]' + registry.records[identity]['node_name'], Link=link.marked(identity), SourceID=0))
         registry.update(identity, remote_node_id=node_id,
                         server={'backend': 'project', 'identity': identity, 'fingerprint': link.fingerprint})
@@ -404,7 +418,7 @@ class RemotePublicationTests(unittest.TestCase):
                           residential=residential))
         return manager, calls, exit_id
 
-    def test_combination_name_publication_and_local_ss_only_connects_entry(self):
+    def test_combination_name_publication_and_local_socks_only_connects_entry(self):
         manager, calls, exit_id = self.create_chain(local=True)
         record = manager.registry.records[CHAIN]
         self.assertEqual(self.node(record["remote_node_id"])["Name"], "[SM]美国-家宽(美国中转)")
@@ -423,7 +437,7 @@ class RemotePublicationTests(unittest.TestCase):
         for key in ("remote_node_id", "local_node_id"):
             self.assertEqual(set(self.server.state["tags"][record[key]]), {"稳定", "家宽"})
 
-    def test_remote_local_ss_enable_accepts_default_and_edit_can_change_port(self):
+    def test_remote_local_socks_enable_accepts_default_and_edit_can_change_port(self):
         manager, _, _ = self.create_chain()
         with patch.dict(sys.modules, {"deploy": fixtures.deploy}), \
                 patch.object(deploy_relay, "ssh_call", side_effect=manager.transport), \
@@ -455,7 +469,7 @@ class RemotePublicationTests(unittest.TestCase):
         combinations = [r for r in self.registry().records.values() if r["kind"] == "remote-relay"]
         self.assertEqual(len(combinations), 1)
         self.assertEqual(combinations[0]["local_port"], 7897)
-        self.assertEqual(fixtures.deploy.SingBox.ss_parameters(self.node(combinations[0]["local_node_id"])["Link"])[0], 7897)
+        self.assertEqual(urllib.parse.urlsplit(self.node(combinations[0]["local_node_id"])["Link"]).port, 7897)
 
     def test_remote_exit_selection_accepts_reality_link_with_spider_path(self):
         identity, _ = self.add("夏威夷家宽", VLESS.replace("#Remote", "&spx=%2F#Remote"))
@@ -652,7 +666,7 @@ class RemotePublicationTests(unittest.TestCase):
     def test_combination_name_conflict_and_external_edit_stop_before_writes(self):
         manager, _, exit_id = self.create_chain(local=True)
         original = copy.deepcopy(self.server.state["nodes"])
-        collision = dict(fixtures.SS_TEMPLATE, ID=999, Name="[SM]新家宽(美国中转)")
+        collision = dict(fixtures.LOCAL_TEMPLATE, ID=999, Name="[SM]新家宽(美国中转)")
         self.server.state["nodes"].append(collision)
         self.server.state["calls"].clear()
         with self.assertRaisesRegex(DeployError, "名称已存在"):
@@ -676,9 +690,8 @@ class RemotePublicationTests(unittest.TestCase):
         combination_before = copy.deepcopy(self.registry().records[CHAIN])
         with patch.object(deploy_relay, "ssh_call", side_effect=DeployError("entry offline")) as transport:
             self.cli(["edit", exit_id], ["3", "7902"])
-            self.cli(["edit", exit_id], ["5", "2", VLESS])
             self.cli(["edit", exit_id], ["1", "夏威夷家宽"])
-            self.cli(["edit", exit_id], ["6", "y"])
+            self.cli(["edit", exit_id], ["5", "y"])
             self.cli(["edit", exit_id], ["4", "y"])
         transport.assert_not_called()
         self.assertEqual(self.registry().records[CHAIN], dict(combination_before, node_name="夏威夷家宽(美国中转)"))
@@ -835,7 +848,7 @@ class RemoteCreationTests(unittest.TestCase):
         registry.register(ENTRY, "adopted:美国", fixtures.deploy.ROOT / ".env", self.client.url, "美国", kind="adopted")
         registry.update(ENTRY, status="active", airport_id=21)
         self.server.state["airports"].append(dict(fixtures.TEMPLATE, id=21, name="美国", remark="[okp:" + ENTRY + "]"))
-        self.server.state["nodes"].append(dict(fixtures.SS_TEMPLATE, ID=501, Protocol="vless", SourceID=21,
+        self.server.state["nodes"].append(dict(fixtures.LOCAL_TEMPLATE, ID=501, Protocol="vless", SourceID=21,
                                                Name="[SM]美国", Link=VLESS))
         self.calls = []
 
@@ -851,7 +864,7 @@ class RemoteCreationTests(unittest.TestCase):
         creation.load()
         return creation
 
-    def invoke(self, answers, *, export_error=None, transport=None, extra=(), action="relay"):
+    def invoke(self, answers, *, export_error=None, exported=None, transport=None, extra=(), action="relay"):
         output = io.StringIO()
         answers = iter(answers)
 
@@ -866,7 +879,7 @@ class RemoteCreationTests(unittest.TestCase):
                 patch.object(fixtures.deploy.sys.stdin, "isatty", return_value=True), \
                 patch("builtins.input", side_effect=answer) as input_mock, \
                 patch.object(fixtures.deploy, "SSH") as ssh, \
-                patch.object(fixtures.deploy, "export_node", return_value=fixtures.NODE, side_effect=export_error), \
+                patch.object(fixtures.deploy, "export_node", return_value=exported or fixtures.NODE, side_effect=export_error), \
                 patch.object(deploy_relay, "ssh_call", transport or self.transport), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             fixtures.deploy.main([action, self.exit_id] + list(extra))
@@ -1033,3 +1046,51 @@ class RemoteCreationTests(unittest.TestCase):
             ssh.return_value.run.side_effect = fixtures.deploy.SSHCommandError("missing", 112)
             with self.assertRaisesRegex(DeployError, "self-update"):
                 deploy_relay.ssh_call(entry, {"operation": "inspect", "identity": CHAIN})
+
+    def test_project_relay_reverifies_legacy_binding_and_preserves_creation_inputs(self):
+        exported = dict(fixtures.NODE, VLESS_URI=VLESS.replace('#Remote', '&spx=%2F&support-x25519mlkem768=true#Remote'))
+        registry = self.registry()
+        registry.update(ENTRY, ssh={"target": "entry.example", "port": 22, "identity": None, "password": False},
+                        server={"backend": "project", "identity": ENTRY,
+                                "fingerprint": parse_node_link(exported['VLESS_URI']).fingerprint})
+        output, _, _ = self.invoke(["2", "1", "", "y", "y", "7901", "y"], exported=exported)
+        self.assertIn("通过 SSH 重新核验", output)
+        self.assertNotIn("入口缺少", output)
+        after = self.registry().records[ENTRY]
+        self.assertEqual(after['server']['fingerprint'], parse_node_link(VLESS).server_fingerprint)
+        chains = [r for r in self.registry().records.values() if r['kind'] == 'remote-relay']
+        self.assertEqual(len(chains), 1)
+        self.assertEqual(chains[0]['local_port'], 7901)
+        self.assertTrue(chains[0]['residential'])
+        self.assertEqual(chains[0]['status'], 'active')
+
+    def test_project_relay_ssh_accepts_client_hint_after_binding(self):
+        entry = dict(self.registry().records[ENTRY], ssh={"target": "entry.example", "port": 22,
+                     "identity": None, "password": False},
+                     server={'backend': 'project', 'identity': ENTRY, 'fingerprint': parse_node_link(VLESS).server_fingerprint})
+        exported = dict(fixtures.NODE, VLESS_URI=VLESS.replace('#Remote', '&spx=%2F&support-x25519mlkem768=true#Remote'))
+        with patch.dict(sys.modules, {"deploy": fixtures.deploy}), \
+                patch.object(fixtures.deploy, "SSH") as ssh, \
+                patch.object(fixtures.deploy, "export_node", return_value=exported), \
+                patch('deploy_panels.run_helper', return_value={'pending': None}), \
+                patch('deploy_panels.recover_pending', return_value={'pending': None}), \
+                patch('deploy_panels.preflight'):
+            ssh.return_value.run.side_effect = [b'', b'{"verified": true}']
+            result = deploy_relay.ssh_call(entry, {"operation": "inspect", "identity": CHAIN})
+        self.assertEqual(result, {'verified': True})
+
+    def test_managed_relay_local_publication_accepts_entry_mihomo_hint(self):
+        def transport(entry, request):
+            result = self.transport(entry, request)
+            if 'link' in result:
+                result['link'] = result['link'].replace('?', '?support-x25519mlkem768=true&spx=%2F&', 1)
+            return result
+
+        self.invoke(["2", "1", "", "y", "y", "7901", "entry.example", "", "y", "y"], transport=transport)
+        record = next(r for r in self.registry().records.values() if r['kind'] == 'remote-relay')
+        self.assertEqual(record['status'], 'active')
+        self.assertIsNotNone(record['local_node_id'])
+        outbound = next(o for o in json.loads(self.path.read_bytes())['outbounds']
+                        if o['tag'] == record['singbox']['outbound_tag'])
+        self.assertNotIn('support-x25519mlkem768', json.dumps(outbound))
+        self.assertEqual(outbound['server_port'], parse_node_link(VLESS).port)

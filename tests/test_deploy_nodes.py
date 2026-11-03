@@ -44,6 +44,24 @@ class NodeLinkTests(unittest.TestCase):
         self.assertEqual(special.host, "2001:db8::1")
         self.assertEqual(parse_node_link(special.marked("a" * 32)).fingerprint, special.fingerprint)
 
+    def test_links_without_query_do_not_call_strict_query_parser(self):
+        links = (SS, SS.replace("ss.example", "[2001:db8::1]"), SOCKS,
+                 "vless://00000000-0000-4000-8000-000000000001@example.invalid:443")
+        # Python 3.10 rejects an empty query with strict_parsing=True.
+        with patch("deploy_links.urllib.parse.parse_qsl", side_effect=ValueError("bad query field: ''")) as parser:
+            for raw in links:
+                with self.subTest(scheme=raw.partition(":")[0]):
+                    link = parse_node_link(raw)
+                    self.assertFalse(link.query)
+                    self.assertEqual(parse_node_link(link.link).fingerprint, link.fingerprint)
+            parser.assert_not_called()
+
+    def test_nonempty_malformed_queries_remain_invalid(self):
+        for suffix in ("?private-secret", "?plugin=one&plugin=two"):
+            with self.subTest(suffix=suffix), self.assertRaises(deploy.DeployError) as error:
+                parse_node_link(SS.replace("#SS", suffix + "#SS"))
+            self.assertNotIn("private-secret", str(error.exception))
+
     def test_supported_local_transports_preserve_parameters(self):
         reality = parse_node_link(VLESS).outbound()
         self.assertEqual(reality["flow"], "xtls-rprx-vision")
@@ -65,6 +83,38 @@ class NodeLinkTests(unittest.TestCase):
             self.assertEqual(link.outbound(), base)
             self.assertEqual(link.fingerprint, digest(base))
             self.assertEqual((link.link, link.query), before)
+
+    def test_no_obfuscation_header_matches_default_outbound(self):
+        for raw in (VLESS, VLESS.split("?", 1)[0] + "#Remote"):
+            link = parse_node_link(raw.replace("#Remote", ("&" if "?" in raw else "?") + "headerType=none#Remote"))
+            before = (link.link, copy.deepcopy(link.query))
+            self.assertEqual(link.outbound(), parse_node_link(raw).outbound())
+            self.assertEqual(link.fingerprint, parse_node_link(raw).fingerprint)
+            self.assertEqual((link.link, link.query), before)
+        with self.assertRaisesRegex(deploy.DeployError, "headerType") as error:
+            parse_node_link(VLESS.replace("#Remote", "&headerType=private-secret#Remote")).outbound()
+        self.assertNotIn("private-secret", str(error.exception))
+
+    def test_server_identity_ignores_valid_mihomo_hint_without_claiming_local_support(self):
+        original = parse_node_link(VLESS)
+        for value in ("true", "false", "1", "0"):
+            link = parse_node_link(VLESS.replace("#Remote", "&spx=%2F&support-x25519mlkem768=" + value + "#Remote"))
+            before = (link.link, copy.deepcopy(link.query), link.fingerprint)
+            self.assertEqual(link.server_fingerprint, original.server_fingerprint)
+            self.assertEqual(link.server_fingerprint, original.fingerprint)
+            with self.assertRaises(deploy.DeployError):
+                link.outbound()
+            self.assertEqual((link.link, link.query, link.fingerprint), before)
+        changed = VLESS.replace(":443", ":8443").replace("#Remote", "&support-x25519mlkem768=true#Remote")
+        self.assertNotEqual(parse_node_link(changed).server_fingerprint, original.server_fingerprint)
+
+    def test_server_identity_rejects_invalid_hints_and_unknown_parameters(self):
+        for raw in (VLESS.replace("#Remote", "&support-x25519mlkem768=private-secret#Remote"),
+                    VLESS.replace("security=reality", "security=tls").replace("#Remote", "&support-x25519mlkem768=true#Remote"),
+                    VLESS.replace("#Remote", "&support-x25519mlkem768=true&pqv=private-secret#Remote")):
+            with self.assertRaises(deploy.DeployError) as error:
+                parse_node_link(raw).server_fingerprint
+            self.assertNotIn("private-secret", str(error.exception))
 
     def test_local_reality_rejects_invalid_spider_and_unknown_security_parameters(self):
         for link in (VLESS.replace("#Remote", "&spx=private-secret#Remote"),
@@ -142,6 +192,32 @@ class NodeWorkflowTests(unittest.TestCase):
                  (["--local-port", str(port)] if port else ["--no-local-node"]) + list(extra))
         return self.record(name)
 
+    def test_add_local_reality_with_explicit_no_obfuscation(self):
+        link = VLESS.replace("#Remote", "&headerType=none#Remote")
+        identity, record = self.add("Shlii", link, 7903)
+        self.assertEqual(record["status"], "active")
+        self.assertIn("headerType=none", self.node(record["remote_node_id"])["Link"])
+        outbound = next(o for o in json.loads(self.path.read_bytes())["outbounds"]
+                        if o["tag"] == record["singbox"]["outbound_tag"])
+        self.assertEqual({k: v for k, v in outbound.items() if k != "tag"}, parse_node_link(VLESS).outbound())
+
+    def test_existing_remote_only_default_header_can_enable_local_with_legacy_fingerprint(self):
+        link = VLESS.replace("#Remote", "&headerType=none#Remote")
+        identity, record = self.add("Shlii", link)
+        parsed = parse_node_link(link)
+        self.assertNotEqual(parsed.fingerprint, parsed.uri_fingerprint)
+        registry = self.registry()
+        registry.update(identity, remote_fingerprints=[parsed.uri_fingerprint])
+        self.cli(["edit", identity, "--local-port", "7903"])
+        after = self.registry().records[identity]
+        self.assertEqual(after["remote_node_id"], record["remote_node_id"])
+        self.assertIsNotNone(after["local_node_id"])
+        self.assertIn(parsed.fingerprint, after["remote_fingerprints"])
+        remote = self.node(after["remote_node_id"])
+        remote["Link"] = remote["Link"].replace(":443", ":8443")
+        with self.assertRaisesRegex(deploy.DeployError, "远端连接参数被外部修改"):
+            self.cli(["edit", identity, "--name", "Changed"])
+
     def test_add_and_duplicate_keep_one_remote_node_without_airport(self):
         identity, record = self.add()
         self.cli(["add", VLESS.replace("#Remote", "#Different"), "--no-local-node"])
@@ -156,39 +232,51 @@ class NodeWorkflowTests(unittest.TestCase):
         self.assertNotIn(VLESS.split("@", 1)[0], json.dumps(repeated))
         self.assertFalse(deploy.ResumeState().path.exists())
 
-    def test_matching_local_credentials_and_protocol_specific_outbound(self):
+    def test_unauthenticated_local_socks_and_protocol_specific_outbound(self):
         _, record = self.add("SS", SS, 7900)
         local = self.node(record["local_node_id"])
-        port, method, password = deploy.SingBox.ss_parameters(local["Link"])
+        port = urllib.parse.urlsplit(local["Link"]).port
         document = json.loads(self.path.read_text())
         inbound, outbound = document["inbounds"][-1], document["outbounds"][-1]
-        self.assertEqual((inbound["listen_port"], inbound["method"], inbound["password"]), (port, method, password))
+        self.assertEqual(inbound, {"type": "socks", "listen": "127.0.0.1", "listen_port": port, "tag": inbound["tag"]})
+        self.assertEqual(local["Protocol"], "socks5")
         self.assertEqual((outbound["type"], outbound["password"]), ("shadowsocks", "remote-secret"))
         self.assertEqual(outbound["tag"], deploy.SingBox.tags(record["singbox"]["owner_id"])[1])
         self.assertNotIn("remote-secret", json.dumps(record))
 
-    def test_edit_link_and_names_retains_ids_and_local_password(self):
+    def test_edit_link_and_names_retains_ids_and_local_connection(self):
         identity, before = self.add(port=7900)
-        local_password = deploy.SingBox.ss_parameters(self.node(before["local_node_id"])["Link"])[2]
+        local_link = self.node(before["local_node_id"])["Link"]
         self.cli(["edit", identity, "--node-link", VLESS.replace("example.invalid", "new.example"), "--name", "Renamed"])
         _, after = self.record("Renamed")
         self.assertEqual((before["remote_node_id"], before["local_node_id"]), (after["remote_node_id"], after["local_node_id"]))
         self.assertEqual(self.node(after["remote_node_id"])["Name"], "[SM]Renamed")
         self.assertEqual(self.node(after["local_node_id"])["Name"], "[SM]Renamed - 本地")
-        self.assertEqual(deploy.SingBox.ss_parameters(self.node(after["local_node_id"])["Link"])[2], local_password)
+        self.assertEqual(self.node(after["local_node_id"])["Link"], local_link)
         self.assertEqual(json.loads(self.path.read_text())["outbounds"][-1]["server"], "new.example")
         self.assertEqual(before["singbox"]["outbound_tag"], after["singbox"]["outbound_tag"])
 
-    def test_independent_local_outbound_survives_remote_changes(self):
-        identity, _ = self.add("Home", VLESS, 7900, ["--local-link", SOCKS])
-        self.cli(["edit", identity, "--node-link", VLESS.replace("example.invalid", "new.example")])
-        _, record = self.record("Home")
-        outbound = json.loads(self.path.read_text())["outbounds"][-1]
-        self.assertEqual((outbound["type"], outbound["server"], outbound["server_port"]), ("socks", "home.example", 26193))
-        self.assertEqual(record["local_source"], "custom")
-        self.cli(["edit", identity, "--same-local"])
-        self.assertEqual(json.loads(self.path.read_text())["outbounds"][-1]["server"], "new.example")
-        self.assertEqual(self.record("Home")[1]["local_source"], "remote")
+    def test_local_outbound_follows_source_protocol_address_and_credentials(self):
+        identity, before = self.add("Home", VLESS, 7900)
+        local_link = self.node(before["local_node_id"])["Link"]
+        for link in (SOCKS, SS, VLESS.replace("example.invalid", "new.example")):
+            with self.subTest(protocol=parse_node_link(link).protocol):
+                self.cli(["edit", identity, "--node-link", link])
+                record = self.record("Home")[1]
+                outbound = json.loads(self.path.read_text())["outbounds"][-1]
+                self.assertEqual({k: v for k, v in outbound.items() if k != "tag"}, parse_node_link(link).outbound())
+                self.assertEqual(record["remote_node_id"], before["remote_node_id"])
+                self.assertEqual(record["local_node_id"], before["local_node_id"])
+                self.assertEqual(self.node(record["local_node_id"])["Link"], local_link)
+
+    def test_removed_local_outbound_options_are_rejected_without_writes(self):
+        for options in (["--local-link", SOCKS], ["--same-local"]):
+            with self.subTest(options=options), self.assertRaises(SystemExit) as error:
+                self.cli(["add", "--node-link", VLESS] + options)
+            self.assertEqual(error.exception.code, 2)
+        self.assertFalse(self.registry().records)
+        self.assertFalse(self.server.state["calls"])
+        self.assertEqual(json.loads(self.path.read_bytes()), self.original)
 
     def test_name_and_protocol_changes_keep_id_tags_and_name_edit_does_not_reload(self):
         identity, before = self.add(port=7900)
@@ -333,16 +421,16 @@ class NodeWorkflowTests(unittest.TestCase):
 
     def test_unmanaged_relay_reference_blocks_rename_before_writes(self):
         identity, _ = self.add("Parent", SOCKS)
-        self.server.state["nodes"].append(dict(fixtures.SS_TEMPLATE, ID=999, Name="External", DialerProxyName="[SM]Parent"))
+        self.server.state["nodes"].append(dict(fixtures.LOCAL_TEMPLATE, ID=999, Name="External", DialerProxyName="[SM]Parent"))
         self.server.state["calls"] = []
         with self.assertRaises(deploy.DeployError):
             self.cli(["edit", identity, "--name", "New parent"])
         self.assertFalse(any(method != "GET" for method, _, _, _ in self.server.state["calls"]))
 
-    def test_local_ss_reference_blocks_rename_before_writes(self):
+    def test_local_socks_reference_blocks_rename_before_writes(self):
         identity, record = self.add(port=7900)
         local_name = self.node(record["local_node_id"])["Name"]
-        self.server.state["nodes"].append(dict(fixtures.SS_TEMPLATE, ID=999, Name="External", DialerProxyName=local_name))
+        self.server.state["nodes"].append(dict(fixtures.LOCAL_TEMPLATE, ID=999, Name="External", DialerProxyName=local_name))
         nodes_before = copy.deepcopy(self.server.state["nodes"])
         config_before = self.path.read_bytes()
         self.server.state["calls"].clear()
@@ -353,12 +441,12 @@ class NodeWorkflowTests(unittest.TestCase):
         self.assertEqual(self.record()[1]["status"], "active")
         self.assertFalse(any(method != "GET" for method, _, _, _ in self.server.state["calls"]))
 
-    def test_new_local_ss_reference_stops_prepared_rename_before_writes(self):
+    def test_new_local_socks_reference_stops_prepared_rename_before_writes(self):
         identity, record = self.add(port=7900)
         manager = NodeManager(self.client, self.registry(), deploy.SingBox(self.config))
         journal = manager.prepare(identity, name="Renamed", local_action="enable", local_port=7900)
         local_name = self.node(record["local_node_id"])["Name"]
-        self.server.state["nodes"].append(dict(fixtures.SS_TEMPLATE, ID=999, Name="External", DialerProxyName=local_name))
+        self.server.state["nodes"].append(dict(fixtures.LOCAL_TEMPLATE, ID=999, Name="External", DialerProxyName=local_name))
         nodes_before = copy.deepcopy(self.server.state["nodes"])
         config_before = self.path.read_bytes()
         self.server.state["calls"].clear()
@@ -547,13 +635,13 @@ class NodeWorkflowTests(unittest.TestCase):
 
     def test_validation_failure_can_restart_in_tui_without_resource_changes(self):
         unsupported = VLESS.replace("#Remote", "&unknown=secret#Remote")
-        identity, record = self.add(link=unsupported, port=7900, extra=["--local-link", SOCKS])
+        identity, record = self.add(link=unsupported)
         global_state = self.subscription_draft()
         global_before = global_state.path.read_bytes()
         nodes_before = copy.deepcopy(self.server.state["nodes"])
         config_before = self.path.read_bytes()
         with self.assertRaisesRegex(deploy.DeployError, "不支持"):
-            self.cli(["edit", identity, "--same-local"])
+            self.cli(["edit", identity, "--local-port", "7900"])
         edit = deploy.ResumeState(node_id=identity)
         self.assertEqual(edit.load()["phase"], "sync")
         self.assertIsNone(NodeManager(self.client, self.registry()).pending(identity))
@@ -562,7 +650,7 @@ class NodeWorkflowTests(unittest.TestCase):
         self.assertEqual(self.server.state["nodes"], nodes_before)
         self.assertEqual(self.path.read_bytes(), config_before)
         self.assertEqual(global_state.path.read_bytes(), global_before)
-        self.assertEqual(self.record()[1]["local_source"], "custom")
+        self.assertEqual(self.record()[1], record)
 
     def test_fresh_cannot_discard_an_applied_node_transaction(self):
         identity, _ = self.add()
@@ -587,10 +675,13 @@ class NodeWorkflowTests(unittest.TestCase):
         identity, initial = self.add(port=7900)
         local_link = self.node(initial["local_node_id"])["Link"]
         self.cli(["relay", identity, "--via", parent_id])
-        self.cli(["edit", identity], ["5", "2", SS])
+        self.cli(["edit", identity], ["2", SS])
+        outbound = json.loads(self.path.read_bytes())["outbounds"][-1]
+        self.assertEqual(outbound["type"], "shadowsocks")
+        self.assertEqual(outbound["detour"], parent["singbox"]["outbound_tag"])
         self.cli(["edit", identity], ["1", "Renamed"])
-        self.cli(["edit", identity], ["5", "1"])
-        self.cli(["edit", identity], ["6", "y"])
+        self.cli(["edit", identity], ["2", VLESS])
+        self.cli(["edit", identity], ["5", "y"])
         current = self.record("Renamed")[1]
         outbound = next(o for o in json.loads(self.path.read_bytes())["outbounds"] if o["tag"] == current["singbox"]["outbound_tag"])
         self.assertEqual(outbound["type"], "vless")
@@ -600,7 +691,6 @@ class NodeWorkflowTests(unittest.TestCase):
         final = self.record("Renamed")[1]
         self.assertEqual(final["status"], "active")
         self.assertIsNone(final["relay_id"])
-        self.assertEqual(final["local_source"], "remote")
         self.assertEqual(final["remote_node_id"], initial["remote_node_id"])
         self.assertEqual(final["local_node_id"], initial["local_node_id"])
         self.assertEqual(self.node(final["local_node_id"])["Link"], local_link)
@@ -616,7 +706,7 @@ class NodeWorkflowTests(unittest.TestCase):
             self.add("Failed", VLESS, 7896)
         failed_id, _ = self.record("Failed")
         self.assertFalse(self.server.state["nodes"])
-        self.cli(["add", "--interactive"], ["2", "3", SS, "Working", "n", "n"])
+        self.cli(["add", "--interactive"], ["2", "4", SS, "Working", "n", "n"])
         self.assertNotIn(failed_id, self.registry().records)
         self.assertEqual(len(self.registry().records), 1)
         self.assertEqual(self.record("Working")[1]["status"], "active")
@@ -628,7 +718,7 @@ class NodeWorkflowTests(unittest.TestCase):
         config_before = self.path.read_bytes()
         with self.assertRaises(deploy.DeployError):
             self.cli(["add", VLESS, "--local-port", "7896"])
-        self.cli(["add", "--interactive"], ["2", "3", SS, "Working", "n", "n", "n"])
+        self.cli(["add", "--interactive"], ["2", "4", SS, "Working", "n", "n", "n"])
         self.assertEqual(self.registry().records[identity], before)
         self.assertEqual(len(self.registry().records), 2)
         self.assertEqual(self.path.read_bytes(), config_before)
@@ -662,7 +752,7 @@ class NodeWorkflowTests(unittest.TestCase):
             self.cli(["edit", identity])
 
     def test_unmanaged_node_requires_explicit_adoption(self):
-        original = dict(fixtures.SS_TEMPLATE, ID=800, Protocol="vless", Name="Existing", Link=VLESS)
+        original = dict(fixtures.LOCAL_TEMPLATE, ID=800, Protocol="vless", Name="Existing", Link=VLESS)
         self.server.state["nodes"] = [original]
         with self.assertRaises(deploy.DeployError):
             self.cli(["add", VLESS, "--no-local-node"])
@@ -701,17 +791,17 @@ class NodeWorkflowTests(unittest.TestCase):
         self.assertEqual(self.server.state["nodes"], [])
 
     def test_standalone_wizard_collects_only_node_details(self):
-        self.cli(["add", "--interactive"], ["3", VLESS, "Chosen", "n", "n"])
+        self.cli(["add", "--interactive"], ["4", VLESS, "Chosen", "n", "n"])
         record = self.record("Chosen")[1]
         self.assertEqual(record["airport_name"], "")
         self.assertEqual(self.server.state["tags"][record["remote_node_id"]], ["稳定"])
 
     def test_tui_new_local_node_can_accept_default_port(self):
         with patch.object(deploy.SublinkPro, "port_available", return_value=True):
-            self.cli(["add", "--interactive"], ["3", VLESS, "Chosen", "n", "y", "", "1"])
+            self.cli(["add", "--interactive"], ["4", VLESS, "Chosen", "n", "y", ""])
         record = self.record("Chosen")[1]
         self.assertEqual(record["local_port"], 7897)
-        self.assertEqual(deploy.SingBox.ss_parameters(self.node(record["local_node_id"])["Link"])[0], 7897)
+        self.assertEqual(urllib.parse.urlsplit(self.node(record["local_node_id"])["Link"]).port, 7897)
 
     def test_cli_new_local_nodes_automatically_select_different_ports(self):
         with patch.object(deploy.SublinkPro, "port_available", return_value=True):
@@ -750,7 +840,7 @@ class NodeWorkflowTests(unittest.TestCase):
             self.assertEqual(set(self.server.state["tags"][record[key]]), {"稳定", "家宽"})
 
     def test_tui_add_can_mark_remote_only_node_as_residential(self):
-        self.cli(["add", "--interactive"], ["3", VLESS, "Home", "y", "n"])
+        self.cli(["add", "--interactive"], ["4", VLESS, "Home", "y", "n"])
         record = self.record("Home")[1]
         self.assertEqual(set(self.server.state["tags"][record["remote_node_id"]]), {"稳定", "家宽"})
         self.assertIsNone(record["local_node_id"])
@@ -764,9 +854,9 @@ class NodeWorkflowTests(unittest.TestCase):
         self.reload.reset_mock()
         original = deploy.prompt_yes_no
         with patch.object(deploy, "prompt_yes_no", wraps=original) as prompt:
-            self.cli(["edit", identity], ["6", "y"])
+            self.cli(["edit", identity], ["5", "y"])
             self.assertFalse(prompt.call_args.args[1])
-            self.cli(["edit", identity], ["6", "n"])
+            self.cli(["edit", identity], ["5", "n"])
             self.assertTrue(prompt.call_args.args[1])
         self.assertEqual(self.server.state["nodes"], before)
         self.assertEqual(set(self.server.state["tags"][remote_id]), {"稳定", "remote-custom"})
@@ -781,21 +871,20 @@ class NodeWorkflowTests(unittest.TestCase):
         self.assertEqual(set(self.server.state["tags"][local_id]), {"稳定", "家宽"})
         self.assertEqual(self.record()[1]["remote_node_id"], record["remote_node_id"])
 
-    def test_resume_switching_custom_local_outbound_to_reality_link_with_spider(self):
+    def test_resume_source_change_to_reality_link_with_spider_updates_local_outbound(self):
         link = VLESS.replace("#Remote", "&spx=%2Fblog#Remote")
-        identity, before = self.add("Home", link, 7900, ["--local-link", SOCKS])
+        identity, before = self.add("Home", SOCKS, 7900)
         local_link = self.node(before["local_node_id"])["Link"]
         self.reload.side_effect = [deploy.DeployError("reload failed"), None]
         with self.assertRaises(deploy.DeployError):
-            self.cli(["edit", identity, "--same-local"])
+            self.cli(["edit", identity, "--node-link", link])
         self.reload.side_effect = None
         checkpoint = deploy.ResumeState(node_id=identity)
-        self.assertTrue(checkpoint.load()["options"]["same_local"])
+        self.assertEqual(checkpoint.load()["options"]["node_link"], link)
         self.assertIsNotNone(NodeManager(self.client, self.registry()).pending(identity))
         self.cli(["edit", identity], ["1"])
         after = self.record("Home")[1]
         self.assertEqual(after["status"], "active")
-        self.assertEqual(after["local_source"], "remote")
         self.assertEqual(after["singbox"]["outbound_tag"], before["singbox"]["outbound_tag"])
         self.assertEqual(after["remote_node_id"], before["remote_node_id"])
         self.assertEqual(after["local_node_id"], before["local_node_id"])
@@ -839,7 +928,7 @@ class NodeWorkflowTests(unittest.TestCase):
     def test_airport_residential_setting_applies_to_owned_source_nodes_only(self):
         identity = "e" * 32
         self.server.state["airports"] = [dict(fixtures.TEMPLATE, id=21, name="Airport", remark="[okp:" + identity + "]")]
-        self.server.state["nodes"] = [dict(fixtures.SS_TEMPLATE, ID=node_id, Protocol="vless", Name=str(node_id),
+        self.server.state["nodes"] = [dict(fixtures.LOCAL_TEMPLATE, ID=node_id, Protocol="vless", Name=str(node_id),
                                           Link=VLESS, SourceID=source_id) for node_id, source_id in ((501, 21), (502, 21), (503, 22))]
         for node_id in (501, 502, 503):
             self.server.state["tags"][node_id] = ["稳定", "custom"]
@@ -852,7 +941,7 @@ class NodeWorkflowTests(unittest.TestCase):
         for node_id in (501, 502):
             self.assertEqual(set(self.server.state["tags"][node_id]), {"稳定", "custom", "家宽"})
         self.assertEqual(self.server.state["tags"][503], ["稳定", "custom"])
-        self.cli(["edit", identity], ["6", "n"])
+        self.cli(["edit", identity], ["5", "n"])
         for node_id in (501, 502):
             self.assertEqual(set(self.server.state["tags"][node_id]), {"稳定", "custom"})
         self.assertEqual(self.server.state["nodes"], before)
@@ -870,13 +959,22 @@ class NodeWorkflowTests(unittest.TestCase):
         self.assertTrue(all(method == "GET" for method, _, _, _ in self.server.state["calls"]))
 
     def test_inventory_missing_current_fields_is_rejected(self):
-        identity, record = self.add("Home", VLESS, 7900, ["--local-link", SOCKS])
+        identity, record = self.add("Home", VLESS, 7900)
         state = deploy.ResumeState()
         document = json.loads((state.directory / "managed.json").read_text())
         old = document["deployments"][identity]
         old.update(kind="adopted", airport_name="Fake airport")
-        old.pop("local_source")
         old.pop("remote_fingerprints")
+        atomic_write(state.directory / "managed.json", json.dumps(document).encode())
+        with self.assertRaisesRegex(deploy.DeployError, "清单无效"):
+            self.registry()
+
+    def test_inventory_rejects_removed_local_outbound_field(self):
+        identity, _ = self.add(port=7900)
+        state = deploy.ResumeState()
+        document = json.loads((state.directory / "managed.json").read_text())
+        self.assertNotIn("local_source", document["deployments"][identity])
+        document["deployments"][identity]["local_source"] = "remote"
         atomic_write(state.directory / "managed.json", json.dumps(document).encode())
         with self.assertRaisesRegex(deploy.DeployError, "清单无效"):
             self.registry()

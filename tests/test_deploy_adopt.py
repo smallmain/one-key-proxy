@@ -1,4 +1,3 @@
-import base64
 import copy
 import json
 from pathlib import Path
@@ -30,20 +29,16 @@ def fixture():
     us = dict(copy.deepcopy(hk), tag="us-out", server="us.example", uuid="00000000-0000-4000-8000-000000000003")
     home_remote = dict(copy.deepcopy(hk), server="home.example", server_port=26192)
     obsolete = dict(copy.deepcopy(hk), tag="old-out", server="obsolete.example")
-    inbounds = [dict(base["inbounds"][0], tag=tag, listen_port=port, password=password)
-                for tag, port, password in (("old-in", 7897, "old"), ("hk-in", 7896, "hk-pass"),
-                                            ("us-in", 7899, "us-pass"), ("home-in", 7898, "home-pass"))]
+    inbounds = [dict(base["inbounds"][0], tag=tag, listen_port=port)
+                for tag, port in (("old-in", 7897), ("hk-in", 7896), ("us-in", 7899), ("home-in", 7898))]
     box = {"inbounds": inbounds + [base["inbounds"][1]],
-           "outbounds": [obsolete, hk, us, {"type": "socks", "tag": "home-out", "server": "home.example",
-                                            "server_port": 26193, "detour": "us-out"}, {"type": "direct", "tag": "direct"}],
+           "outbounds": [obsolete, hk, us, dict(home_remote, tag="home-out", detour="us-out"), {"type": "direct", "tag": "direct"}],
            "route": {"final": "old-out", "rules": [{"inbound": [f"{name}-in"], "action": "route", "outbound": f"{name}-out"}
                                                     for name in ("hk", "us", "home")] +
                      [{"inbound": ["other-in"], "action": "route", "outbound": "direct"}]}}
     nodes = []
-    for ident, name, port, password in ((917, "HK local", 7896, "hk-pass"), (913, "US local", 7899, "us-pass"),
-                                       (507, "Home local", 7898, "home-pass")):
-        auth = base64.urlsafe_b64encode(f"aes-128-gcm:{password}".encode()).decode().rstrip("=")
-        nodes.append({"ID": ident, "Name": name, "Link": f"ss://{auth}@127.0.0.1:{port}", "Protocol": "ss",
+    for ident, name, port in ((917, "HK local", 7896), (913, "US local", 7899), (507, "Home local", 7898)):
+        nodes.append({"ID": ident, "Name": name, "Link": f"socks5://127.0.0.1:{port}", "Protocol": "socks5",
                       "NameMode": "remark", "SourceID": 0, "Group": "SM", "DialerProxyName": ""})
     for ident, name, outbound, source, relay in ((918, "HK", hk, 11, ""), (912, "US", us, 10, ""),
                                                (501, "Home", home_remote, 0, "US")):
@@ -111,6 +106,17 @@ class AdoptionTests(unittest.TestCase):
     def run_adoption(self):
         adopt_manifest(self.config, self.root / ".env", self.manifest_path, self.state)
 
+    def test_adoption_accepts_unauthenticated_loopback_socks(self):
+        self.run_adoption()
+        registry = ManagedDeployments(self.state)
+        after = json.loads(self.path.read_text())
+        for identity, record in registry.records.items():
+            inbound = next(i for i in after["inbounds"] if i["tag"] == SingBox.tags(identity)[0])
+            self.assertEqual(inbound["type"], "socks")
+            self.assertNotIn("users", inbound)
+            self.assertNotIn("method", inbound)
+            self.assertEqual(record["status"], "active")
+
     def test_adoption_preserves_connections_and_rewrites_all_references(self):
         original_links = {n["ID"]: urllib.parse.urlsplit(n["Link"])._replace(fragment="").geturl() for n in self.client.data}
         self.run_adoption()
@@ -143,6 +149,39 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue(all(r["status"] == "adopting" for r in ManagedDeployments(self.state).records.values()))
         self.run_adoption()
         self.assertTrue(all(r["status"] == "active" for r in ManagedDeployments(self.state).records.values()))
+
+    def socks_outbound(self):
+        outbound = {"type": "socks", "tag": "home-out", "server": "home.example", "server_port": 26193,
+                    "username": "user", "password": "secret", "detour": "us-out"}
+        changed = copy.deepcopy(self.before)
+        changed["outbounds"][3] = outbound
+        self.path.write_text(json.dumps(changed))
+        return outbound
+
+    def test_adoption_accepts_matching_socks_source(self):
+        self.socks_outbound()
+        remote = next(n for n in self.client.data if n["ID"] == 501)
+        remote.update(Link="socks5://user:secret@home.example:26193", Protocol="socks5")
+        self.run_adoption()
+        records = ManagedDeployments(self.state).records
+        self.assertTrue(all(r["status"] == "active" for r in records.values()))
+
+    def test_adoption_rejects_different_protocol_even_with_same_host(self):
+        self.socks_outbound()
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(DeployError, "SOCKS 出站.*不匹配"):
+            self.run_adoption()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse(ManagedDeployments(self.state).records)
+
+    def test_adoption_rejects_socks_port_or_credentials_mismatch(self):
+        self.socks_outbound()
+        remote = next(n for n in self.client.data if n["ID"] == 501)
+        for link in ("socks5://user:secret@home.example:26194", "socks5://user:changed@home.example:26193"):
+            with self.subTest(link=link):
+                remote.update(Link=link, Protocol="socks5")
+                with self.assertRaisesRegex(DeployError, "SOCKS 出站.*不匹配"):
+                    self.run_adoption()
 
     def test_external_change_after_interruption_is_not_overwritten(self):
         self.client.fail_once = True

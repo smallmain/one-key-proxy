@@ -1,0 +1,187 @@
+--- a/node/protocol/socks5.go
++++ b/node/protocol/socks5.go
+@@ -19,11 +19,11 @@
+ 		FieldMeta{Name: "Username", Label: "用户名", Type: "string", Group: "auth", Advanced: true},
+ 		FieldMeta{Name: "Password", Label: "密码", Type: "string", Group: "auth", Secret: true, Advanced: true},
+ 	)
+-	MustRegisterProtocol(newProxyProtocolSpec(base, func(link Urls, _ OutputConfig) (Proxy, error) {
++	MustRegisterProtocol(newProxySurgeProtocolSpec(base, func(link Urls, _ OutputConfig) (Proxy, error) {
+ 		return buildSocks5Proxy(link)
+ 	}, func(proxy Proxy) bool {
+ 		return proxyTypeMatches(proxy, "socks5")
+-	}, ConvertProxyToSocks5, EncodeSocks5URL))
++	}, ConvertProxyToSocks5, EncodeSocks5URL, buildSocks5SurgeLine))
+ }
+ 
+ type Socks5 struct {
+@@ -111,3 +111,29 @@
+ 	}
+ 	return Proxy{Name: socks5.Name, Type: "socks5", Server: socks5.Server, Port: FlexPort(utils.GetPortInt(socks5.Port)), Username: socks5.Username, Password: socks5.Password, Dialer_proxy: link.DialerProxyName}, nil
+ }
++
++func buildSocks5SurgeLine(link string, config OutputConfig) (string, string, error) {
++	socks5, err := DecodeSocks5URL(link)
++	if err != nil {
++		return "", "", err
++	}
++	server := replaceSurgeHost(socks5.Server, config)
++	port := utils.GetPortInt(socks5.Port)
++	if server == "" || port < 1 || port > 65535 || strings.Contains(socks5.Name, "=") {
++		return "", "", fmt.Errorf("invalid SOCKS5 endpoint or Surge policy name")
++	}
++	for _, value := range []string{socks5.Name, server, socks5.Username, socks5.Password} {
++		if strings.ContainsAny(value, ",\r\n\"") {
++			return "", "", fmt.Errorf("SOCKS5 Surge fields contain unsupported delimiters")
++		}
++	}
++	line := fmt.Sprintf("%s = socks5, %s, %d", socks5.Name, server, port)
++	if socks5.Username != "" {
++		line += ", username=" + socks5.Username
++	}
++	if socks5.Password != "" {
++		line += ", password=" + socks5.Password
++	}
++	line = fmt.Sprintf("%s, udp-relay=%t", line, config.Udp)
++	return line, socks5.Name, nil
++}
+--- /dev/null
++++ b/node/protocol/socks5_surge_test.go
+@@ -0,0 +1,116 @@
++package protocol
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestSocks5SurgeLine(t *testing.T) {
++	tests := []struct {
++		name   string
++		link   string
++		config OutputConfig
++		want   string
++	}{
++		{
++			name:   "loopback without authentication",
++			link:   "socks5://127.0.0.1:7896#%5BSM%5D%E5%AE%B6%E5%AE%BD%20-%20%E6%9C%AC%E5%9C%B0",
++			config: OutputConfig{Udp: true},
++			want:   "[SM]\u5bb6\u5bbd - \u672c\u5730 = socks5, 127.0.0.1, 7896, udp-relay=true",
++		},
++		{
++			name: "percent encoded authentication is decoded once",
++			link: "socks5://user%40example:p%3Ass%2520@proxy.example:1080#Authenticated",
++			want: "Authenticated = socks5, proxy.example, 1080, username=user@example, password=p:ss%20, udp-relay=false",
++		},
++		{
++			name: "username without password",
++			link: "socks5://user@proxy.example:1080#User",
++			want: "User = socks5, proxy.example, 1080, username=user, udp-relay=false",
++		},
++		{
++			name: "IPv6 endpoint",
++			link: "socks5://[2001:db8::1]:1080#IPv6",
++			want: "IPv6 = socks5, 2001:db8::1, 1080, udp-relay=false",
++		},
++		{
++			name: "host replacement",
++			link: "socks5://proxy.example:1080#Mapped",
++			config: OutputConfig{ReplaceServerWithHost: true,
++				HostMap: map[string]string{"proxy.example": "192.0.2.1"}},
++			want: "Mapped = socks5, 192.0.2.1, 1080, udp-relay=false",
++		},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			line, name, err := buildSocks5SurgeLine(test.link, test.config)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if line != test.want {
++				t.Fatalf("got %q, want %q", line, test.want)
++			}
++			if name != strings.SplitN(test.want, " = ", 2)[0] {
++				t.Fatalf("wrong group member: %q", name)
++			}
++		})
++	}
++}
++
++func TestSocks5SurgeLineRejectsInvalidFields(t *testing.T) {
++	for _, link := range []string{
++		"not-a-node",
++		"socks5://proxy.example:0#Invalid",
++		"socks5://proxy.example:65536#Invalid",
++		"socks5://:1080#Invalid",
++		"socks5://user:pass%2Ctls%3Dtrue@proxy.example:1080#Invalid",
++		"socks5://proxy.example:1080#Invalid%0AInjected",
++		"socks5://proxy.example:1080#Invalid%3DName",
++		"socks5://user:pass%22word@proxy.example:1080#Invalid",
++	} {
++		t.Run(link, func(t *testing.T) {
++			line, name, err := buildSocks5SurgeLine(link, OutputConfig{})
++			if err == nil || line != "" || name != "" {
++				t.Fatalf("invalid link produced line=%q name=%q error=%v", line, name, err)
++			}
++		})
++	}
++}
++
++func TestEncodeSurgeIncludesSocks5NodesAndGroups(t *testing.T) {
++	link := "socks5://127.0.0.1:7896#Local"
++	if !ProtocolSupportsClient("socks5", ClientSurge) || !SupportsClientForLink(link, ClientSurge) {
++		t.Fatal("SOCKS5 must pass the Surge client capability filter")
++	}
++	if _, ok := detectProtocol(link).(SurgeCapable); !ok {
++		t.Fatal("SOCKS5 must implement SurgeCapable")
++	}
++	template := filepath.Join(t.TempDir(), "socks5-surge-regression.conf")
++	content := "[Proxy]\nDIRECT = direct\n\n[Proxy Group]\nAll = select\nResidential = select, include-all-proxies=true, policy-regex-filter=Residential\n"
++	if err := os.WriteFile(template, []byte(content), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	ss := EncodeSSURL(Ss{Name: "ExistingSS", Server: "ss.example", Port: 8388,
++		Param: Param{Cipher: "aes-128-gcm", Password: "test-password"}})
++	output, err := EncodeSurge([]string{link, "socks5://127.0.0.1:7897#ResidentialLocal", ss},
++		OutputConfig{Surge: template, Udp: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, want := range []string{
++		"Local = socks5, 127.0.0.1, 7896, udp-relay=true",
++		"ResidentialLocal = socks5, 127.0.0.1, 7897, udp-relay=true",
++		"ExistingSS = ss, ss.example, 8388",
++		"All = select, Local, ResidentialLocal, ExistingSS",
++		"Residential = select, include-all-proxies=true, policy-regex-filter=Residential",
++	} {
++		if !strings.Contains(output, want) {
++			t.Errorf("missing %q in generated subscription", want)
++		}
++	}
++	if strings.Contains(output, "username=") || strings.Contains(output, "password=,") {
++		t.Fatal("unauthenticated SOCKS5 nodes must omit authentication parameters")
++	}
++}
+--- a/README.md
++++ b/README.md
+@@ -191,7 +191,7 @@
+ |:---|:---|
+ | **v2ray** | base64 common format, without Clash/mihomo specific protocols such as Mieru, Snell, and OpenVPN |
+ | **clash / mihomo** | ss, ssr, trojan, vmess, vless, hy, hy2, tuic, AnyTLS, Socks5, HTTP, HTTPS, Mieru, Snell, OpenVPN |
+-| **surge** | ss, trojan, vmess, hy2, tuic, AnyTLS, Snell |
++| **surge** | ss, trojan, vmess, hy2, tuic, AnyTLS, Snell, Socks5 |
+ 
+ > [!NOTE]
+ > Mieru currently supports Clash/mihomo YAML import and export only. Official Mieru has `mieru://` and `mierus://` share links, but does not define a general URL schema suitable for field by field editing. For raw editing and Clash/mihomo import write back, SublinkPro uses an internal editable form: `mieru://username:password@server:port?...#name`, with port ranges written as `portRange=2090-2099`. v2ray and Surge don't support Mieru in SublinkPro. Subscription output skips that protocol instead of converting it to a downgraded form.
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -191,7 +191,7 @@
+ |:---|:---|
+ | **v2ray** | base64 通用格式（不输出 Clash/mihomo 专属协议，如 Mieru、Snell、OpenVPN） |
+ | **clash / mihomo** | ss, ssr, trojan, vmess, vless, hy, hy2, tuic, AnyTLS, Socks5, HTTP, HTTPS, Mieru, Snell, OpenVPN |
+-| **surge** | ss, trojan, vmess, hy2, tuic, AnyTLS, Snell |
++| **surge** | ss, trojan, vmess, hy2, tuic, AnyTLS, Snell, Socks5 |
+ 
+ > [!NOTE]
+ > Mieru 当前仅支持 Clash/mihomo YAML 导入与导出。Mieru 官方存在 `mieru://` / `mierus://` 分享链接，但未定义适合逐字段编辑的通用 URL schema；SublinkPro 为原始编辑与 Clash/mihomo 导入回写使用内部可编辑形态：`mieru://username:password@server:port?...#name`，端口范围使用 `portRange=2090-2099`。v2ray 与 Surge 当前不支持 Mieru，订阅输出会跳过该协议而不是降级转换。

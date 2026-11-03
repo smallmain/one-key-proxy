@@ -8,6 +8,7 @@ import urllib.parse
 import uuid
 
 from deploy_resources import DeployError, ManagedDeployments, SingBox, atomic_write, digest
+from deploy_links import parse_node_link
 
 
 def node_fields(client, node):
@@ -68,16 +69,22 @@ def prepare_adoption(client, box, registry, manifest, env_file):
         remote = nodes.get(group["remote_node_id"])
         if not inbound or not outbound or not local or not remote:
             raise DeployError("接管清单中的 sing-box 或 SublinkPro 条目不存在。")
-        port, method, password = box.ss_parameters(local["Link"])
-        if (inbound.get("type") != "shadowsocks" or inbound.get("listen") != "127.0.0.1"
-                or inbound.get("listen_port") != port or inbound.get("method") != method
-                or inbound.get("password") != password):
+        expected_inbound = box.local_inbound(local["Link"])
+        port = expected_inbound["listen_port"]
+        if (any(inbound.get(key) != expected_inbound.get(key) for key in
+                ("type", "listen", "listen_port"))
+                or inbound.get("users")):
             raise DeployError("本地节点与 sing-box 入站凭据或端口不匹配。")
         if outbound.get("type") == "vless":
             expected = box.vless(outbound, remote["Link"])
             if any(outbound.get(k) != expected.get(k) for k in ("server", "server_port", "uuid", "flow", "tls")):
                 raise DeployError("VLESS 出站与 SublinkPro 远端节点不匹配。")
-        elif outbound.get("type") != "socks" or remote.get("LinkHost") != outbound.get("server"):
+        elif outbound.get("type") == "socks":
+            expected = parse_node_link(remote["Link"]).outbound()
+            if (expected["type"] != "socks" or outbound.get("version", "5") != expected.get("version", "5")
+                    or any(outbound.get(k) != expected.get(k) for k in ("server", "server_port", "username", "password"))):
+                raise DeployError("SOCKS 出站与 SublinkPro 远端节点不匹配。")
+        else:
             raise DeployError("仅支持明确关联的 VLESS 或 SOCKS 出口。")
         relay = group["relay"]
         if relay is not None and relay not in identities:
@@ -112,7 +119,6 @@ def prepare_adoption(client, box, registry, manifest, env_file):
                              "airport_id": group["airport_id"], "local_node_id": group["local_node_id"],
                              "remote_node_id": group["remote_node_id"], "airport_name": airport_name, "node_name": name,
                              "local_port": port, "kind": "adopted", "status": "adopting", "singbox": None,
-                             "local_source": "custom" if outbound["type"] == "socks" else "remote",
                              "remote_fingerprints": [], "ssh": None, "server": None, "residential": False, "part_errors": {}, "remote_relay": None,
                              "relay_id": identities[relay] if relay else None}
     try:

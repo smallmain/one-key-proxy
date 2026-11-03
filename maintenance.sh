@@ -49,7 +49,7 @@ readonly OKP_MAINTENANCE_TEST_MODE
 #   okp_hook_before_restore ROOTFS_DIR
 #   okp_hook_after_restore
 #   okp_hook_verify_restore
-#   okp_hook_reconfigure SCOPE            # SCOPE: all/address/ports/domain
+#   okp_hook_reconfigure SCOPE            # SCOPE: all/address/ports/domain/reality
 #   okp_hook_renew_certificate
 #   okp_hook_project_update_info
 #   okp_hook_project_update
@@ -1580,7 +1580,7 @@ maintenance_reconfigure() {
     local scope=${1:-all}
 
     case "$scope" in
-        all | address | ports | domain) ;;
+        all | address | ports | domain | reality) ;;
         *)
             _maintenance_log_error "未知重配范围: ${scope}"
             return 2
@@ -1786,6 +1786,7 @@ maintenance_main_menu() {
         printf '7. 手动更新\n'
         printf '8. 凭据轮换\n'
         printf '9. 逐项卸载（默认全选）\n'
+        printf '10. 更换 REALITY 目标\n'
         printf '0. 退出\n'
         maintenance_read choice '请选择' || return 1
         case "$choice" in
@@ -1798,6 +1799,7 @@ maintenance_main_menu() {
             7) maintenance_update_menu ;;
             8) maintenance_credentials_menu ;;
             9) maintenance_uninstall ;;
+            10) maintenance_reconfigure reality ;;
             0) return 0 ;;
             *) _maintenance_log_warn '无效选项。' ;;
         esac
@@ -1820,7 +1822,7 @@ maintenance_usage() {
   one-key-proxy update-address          手动更新公网地址
   one-key-proxy reconfigure-ports       重配监听与发布端口
   one-key-proxy reconfigure-domain      重配普通 VPS 域名
-  one-key-proxy reconfigure [范围]      范围: all/address/ports/domain
+  one-key-proxy reconfigure [范围]      范围: all/address/ports/domain/reality
   one-key-proxy renew-cert              手动续签证书
   one-key-proxy rotate-panel            轮换面板凭据
   one-key-proxy rotate-token            轮换项目管理 API Token

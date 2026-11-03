@@ -3,11 +3,11 @@
 if [[ ${OKP_PRODUCTION_MODE:-false} == true ]]; then
   PANEL_PATH=/
   MIN_CLIENT_VERSION=1.0.0
-  DEFAULT_REALITY_TARGET=www.cloudflare.com:443
+  DEFAULT_REALITY_TARGET=www.tencentcloud.com:443
 else
   : "${PANEL_PATH:=/}"
   : "${MIN_CLIENT_VERSION:=1.0.0}"
-  : "${DEFAULT_REALITY_TARGET:=www.cloudflare.com:443}"
+  : "${DEFAULT_REALITY_TARGET:=www.tencentcloud.com:443}"
 fi
 
 # The local SSH launcher sends only this allowlist, using the state file codec.

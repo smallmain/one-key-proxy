@@ -23,9 +23,11 @@ class PanelUpdateRequired(DeployError):
 
 def run_helper(ssh, request):
     from deploy_parts import agent_result
-    payload = dict(request, sources={name: (SOURCES / name).read_text(encoding='utf-8')
-                                   for name in ('panel_version.py', 'panel_maintenance.py', 'entry_management.py')})
-    bootstrap = ("import json,sys,types; request=json.loads(sys.stdin.buffer.read(1048577)); "
+    names = ['panel_version.py', 'panel_maintenance.py', 'entry_management.py']
+    if request['operation'].startswith('config-'):
+        names.append('config_update.py')
+    payload = dict(request, sources={name: (SOURCES / name).read_text(encoding='utf-8') for name in names})
+    bootstrap = ("import json,sys,types; request=json.loads(sys.stdin.buffer.read(8388609)); "
                  "policy=types.ModuleType('okp_panel_version'); sys.modules[policy.__name__]=policy; "
                  "exec(compile(request['sources']['panel_version.py'],'panel_version.py','exec'),policy.__dict__); "
                  "scope={'__name__':'okp_panel_bootstrap'}; "
@@ -248,12 +250,14 @@ def select_panels(rows):
     selected = set(eligible)
     while True:
         limit = f'；Xray 兼容上限 {MAX_XRAY_VERSION}' if MAX_XRAY_VERSION else ''
-        print(f'\n更新面板（最低支持 {MIN_PANEL_VERSION}{limit}）')
+        print(f'\n更新配置（面板最低支持 {MIN_PANEL_VERSION}{limit}）')
         for index, row in enumerate(rows, 1):
             mark = 'x' if index in selected else ' ' if index in eligible else '-'
             current, target = row.get('current', '未检测'), row.get('target') or '-'
             core = f'；Xray {row.get("core_current") or "未检测"} -> {row.get("core_target") or "-"}'
             print(f'  {index}. [{mark}] {row["name"]}  3x-ui {current} -> {target}{core}  {row["reason"]}')
+            if row.get('steps'):
+                print('       ' + row['steps'])
         value = prompt_text('编号切换勾选（多个用空格或逗号分隔）；a 全选，n 清空，u 更新，r 重新检测，d 编号补全 SSH，0 返回',
                             'u' if selected else '0').lower()
         if value in ('0', 'r'):
@@ -265,7 +269,7 @@ def select_panels(rows):
         elif value == 'u':
             if selected:
                 return 'update', selected
-            print('尚未勾选任何可更新面板。')
+            print('尚未勾选任何可更新配置。')
         elif value == 'a':
             selected = set(eligible)
         elif value == 'n':
@@ -303,13 +307,13 @@ class Sessions:
         return self.connections[key]
 
 
-def scan(registry, sessions, available, core_target):
+def scan(registry, sessions, available, core_target, updates=None):
     from deploy_parts import PartInput
     from deploy import export_node
     from deploy_links import parse_node_link
     rows, by_panel = [], {}
     for identity, record in candidate_records(registry):
-        row = {'identity': identity, 'name': record['node_name'], 'eligible': False, 'reason': 'SSH 未设置'}
+        row = {'identity': identity, 'identities': [identity], 'name': record['node_name'], 'eligible': False, 'reason': 'SSH 未设置'}
         binding = record['ssh']
         if not binding:
             draft = PartInput(registry, identity, 'server')
@@ -331,10 +335,14 @@ def scan(registry, sessions, available, core_target):
                 if not record['server'] and not information.get('api_verified'):
                     context = {}
                 if record['server'] and record['server']['backend'] == 'project' and not information.get('pending'):
-                    exported = export_node(ssh)
-                    if (exported['INSTALLATION_ID'].lower() != record['server']['identity']
-                            or parse_node_link(exported['VLESS_URI']).fingerprint != record['server']['fingerprint']):
-                        raise DeployError('SSH 目标与此配置原先绑定的服务器不一致，不能更新。')
+                    config_status = (run_helper(ssh, updates.request(identity, 'config-info')) if updates else {})
+                    if not config_status.get('runtime_pending'):
+                        exported = export_node(ssh)
+                        if updates:
+                            updates.validate_export(identity, exported)
+                        elif (exported['INSTALLATION_ID'].lower() != record['server']['identity']
+                              or parse_node_link(exported['VLESS_URI']).server_fingerprint != record['server']['fingerprint']):
+                            raise DeployError('SSH 目标与此配置原先绑定的服务器不一致，不能更新。')
                 current = information['current']
                 if version(current) is None:
                     raise DeployError('无法识别面板版本。')
@@ -343,6 +351,7 @@ def scan(registry, sessions, available, core_target):
                 core_current = information.get('core_current')
                 core_changed = version(core_current) is not None and version(core_current) != version(core_target)
                 row.update(ssh=ssh, current=current, target=target, context=context, core_current=core_current, core_target=core_target,
+                           updatable=information['updatable'],
                            eligible=information['updatable'] and core_target is not None and
                            (update_available(current, target) or core_changed),
                            reason=describe(current, release) if information['updatable'] else information['reason'])
@@ -351,14 +360,25 @@ def scan(registry, sessions, available, core_target):
                 elif information['updatable'] and core_changed and not update_available(current, target):
                     row['reason'] = '可调整 Xray' if xray_compatible(core_current) else 'Xray 不兼容，需调整'
                 if information.get('pending'):
-                    row.update(eligible=True, target=current, pending=True, reason='更新中断，需恢复原版本后重新检测')
+                    row.update(eligible=True, pending=True, reason='更新中断，将恢复后继续')
+                if updates:
+                    updates.inspect(row)
                 key = information.get('panel_id') or (record['server']['identity'] if record['server'] else
                                                      (binding['target'].removeprefix('root@'), binding['port'] or 22))
                 if key in by_panel:
-                    by_panel[key]['name'] += ' / ' + row['name']
+                    previous = by_panel[key]
+                    identities = previous['identities'] + [identity]
+                    name = previous['name'] + ' / ' + row['name']
+                    if row.get('config_status') and not previous.get('config_status'):
+                        previous.update(row)
+                    previous.update(name=name, identities=identities)
+                    if row.get('migration_blocked') or previous.get('migration_blocked'):
+                        previous.update(eligible=False, migration_blocked=True,
+                                        reason='REALITY 迁移前需清理关联远程中转')
                     continue
                 by_panel[key] = row
             except DeployError as error:
+                row['eligible'] = False
                 row['reason'] = str(error)
         rows.append(row)
     return rows
@@ -368,16 +388,18 @@ def manage_panels(args):
     from deploy import ResumeState, prompt_yes_no
     from deploy_parts import PartInput, diagnostic, ssh_options
     if not sys.stdin.isatty():
-        raise DeployError('更新面板需要交互终端，请从主菜单选择“更新面板”。')
+        raise DeployError('更新配置需要交互终端，请从主菜单选择“更新配置”。')
     with ResumeState().locked() as state, Sessions() as sessions:
         registry = ManagedDeployments(state)
+        from deploy_updates import ConfigUpdates
+        updates = ConfigUpdates(registry, run_helper)
         if not candidate_records(registry):
             print('暂无面板配置。')
             return
         available = catalog(required=False)
         core_target = compatible_core(required=False)
         while True:
-            rows = scan(registry, sessions, available, core_target)
+            rows = scan(registry, sessions, available, core_target, updates)
             action, indices = select_panels(rows)
             if action == '0':
                 return
@@ -398,15 +420,13 @@ def manage_panels(args):
             selected = [rows[index - 1] for index in sorted(indices)]
             print('将更新：' + '；'.join(row['name'] + ' 3x-ui ' + row['current'] + ' -> ' + row['target']
                   + '，Xray ' + (row.get('core_current') or '未检测') + ' -> ' + (row.get('core_target') or '-') for row in selected))
-            if not prompt_yes_no('确认更新所选面板？更新前会备份，期间代理会短暂中断', True):
+            if not prompt_yes_no('确认更新所选配置？包括所列脚本、面板/内核、目标迁移及客户端刷新；更新前会备份，期间代理会短暂中断', True):
                 continue
             for row in selected:
                 try:
-                    print(f'正在处理面板：{row["name"]}。')
-                    result = run_helper(row['ssh'], dict(row.get('context', {}),
-                        operation='panel-recover' if row.get('pending') else 'panel-update',
-                        current=row['current'], target=row['target'], core_current=row.get('core_current'), core_target=row.get('core_target')))
+                    print(f'正在更新配置：{row["name"]}。')
+                    result = updates.execute(row)
                     print(f'{row["name"]}：完成，3x-ui {result["current"]}；Xray {result.get("core_current") or "待重新检测"}。')
                 except DeployError as error:
-                    print(row['name'] + '：' + str(error), file=sys.stderr)
+                    print(row['name'] + '：' + str(error) + '；可再次进入“更新配置”继续。', file=sys.stderr)
             return

@@ -60,6 +60,9 @@ def command(arguments, *, timeout=60, **kwargs):
                 process.wait()
         if not isinstance(error, (OSError, subprocess.TimeoutExpired)):
             raise
+        if isinstance(error, FileNotFoundError):
+            program = Path(arguments[0]).name
+            raise PanelError('面板维护缺少可执行程序：' + program + '。') from None
         raise PanelError('面板维护命令失败或超时；已保留恢复记录。') from None
     finally:
         if process is not None:
@@ -150,12 +153,13 @@ def locked():
             raise PanelError('已有面板更新正在执行，请稍后重新检测。') from None
         with contextlib.ExitStack() as stack:
             project_fd = None
-            if (PROJECT / 'maintenance.sh').is_file():
-                secure_directory(PROJECT)
-                project_info = (PROJECT / 'maintenance.sh').lstat()
-                if (not stat.S_ISREG(project_info.st_mode) or project_info.st_uid != os.getuid()
-                        or project_info.st_nlink != 1 or project_info.st_mode & 0o022):
-                    raise PanelError('项目维护入口权限不安全。')
+            if (PROJECT / 'maintenance.sh').is_file() or (STATE / 'runtime-pending.json').exists():
+                if PROJECT.exists():
+                    secure_directory(PROJECT)
+                    project_info = (PROJECT / 'maintenance.sh').lstat()
+                    if (not stat.S_ISREG(project_info.st_mode) or project_info.st_uid != os.getuid()
+                            or project_info.st_nlink != 1 or project_info.st_mode & 0o022):
+                        raise PanelError('项目维护入口权限不安全。')
                 secure_directory(PROJECT_LOCK.parent.parent)
                 secure_directory(PROJECT_LOCK.parent)
                 inherited = os.environ.get('OKP_OPERATION_LOCK_FD', '')
@@ -242,17 +246,18 @@ def info(request=None, context=None):
         except PanelError:
             pass
     current = api_current or binary_version()
+    core_current = None
     try:
         if context and context.get('entry_id') and api_current is None:
             raise PanelError('已绑定面板的管理 API 暂不可用，无法确认更新目标；请先修复 3x-ui 管理配置。')
         if api_current and binary_version() != api_current:
             raise PanelError('管理 API 与本机标准安装版本不一致，请使用对应面板的原安装工具更新。')
-        installation()
         core_current = core_version()
+        installation()
         error = None
     except PanelError as problem:
         error = str(problem)
-    return {'current': current, 'core_current': core_current if error is None else None,
+    return {'current': current, 'core_current': core_current,
             'updatable': error is None, 'reason': error,
             'panel_id': panel_id, 'api_verified': api_current is not None}
 
@@ -678,7 +683,7 @@ def update(request):
                 try:
                     restore(journal)
                 except Exception:
-                    raise PanelError('面板更新失败且自动恢复未完成；请重新进入更新面板恢复，备份保留在 /etc/one-key-proxy-panel。') from None
+                    raise PanelError('面板更新失败且自动恢复未完成；请重新进入“更新配置”恢复，备份保留在 /etc/one-key-proxy-panel。') from None
                 raise PanelError('面板更新失败，已恢复原版本和数据库；备份已保留。') from None
             (STATE / 'pending.json').unlink()
             shutil.rmtree(journal['old'])
@@ -712,6 +717,11 @@ def main(request=None):
             with locked():
                 recover()
                 result = info()
+        elif operation in ('config-info', 'config-runtime', 'config-migrate'):
+            from types import SimpleNamespace
+            scope = {'__name__': 'okp_config_update'}
+            exec(compile(request['sources']['config_update.py'], 'config_update.py', 'exec'), scope)
+            result = scope['handle'](request, SimpleNamespace(**globals()))
         else:
             raise PanelError('面板维护操作无效。')
         print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))

@@ -1,12 +1,18 @@
 import contextlib
 import copy
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
+import pty
+import select
+import signal
 import subprocess
 import sys
 import tempfile
+import termios
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -84,6 +90,71 @@ class CredentialTests(unittest.TestCase):
                 self.assertEqual(deploy_ssh_askpass.main(), 0)
                 vault.assert_not_called()
                 input_.assert_called_once()
+
+    def test_first_host_key_confirmation_uses_real_controlling_terminal(self):
+        master, slave = pty.openpty()
+        self.addCleanup(lambda: os.close(master) if master is not None else None)
+        prompt = 'Are you sure you want to continue connecting (yes/no/[fingerprint])? '
+
+        def prepare_terminal():
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        try:
+            child = subprocess.Popen([sys.executable, str(fixtures.ROOT / 'deploy_ssh_askpass.py'), prompt],
+                                     stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     start_new_session=True,
+                                     preexec_fn=prepare_terminal)
+        finally:
+            os.close(slave)
+        try:
+            output = b''
+            deadline = time.monotonic() + 10
+            while prompt.encode() not in output and time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.1)
+                if ready:
+                    try:
+                        output += os.read(master, 4096)
+                    except OSError:
+                        break
+                if child.poll() is not None:
+                    break
+            self.assertIn(prompt.encode(), output)
+            os.write(master, b'yes\n')
+            ready, _, _ = select.select([child.stdout], [], [], 10)
+            self.assertTrue(ready, 'Host-key confirmation did not return an answer.')
+            answer = child.stdout.readline()
+            # macOS can defer a controlling-session leader's exit until the PTY closes.
+            os.close(master)
+            master = None
+            remaining, diagnostic = child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 0, diagnostic.decode())
+            self.assertEqual(answer + remaining, b'yes\n')
+            self.assertEqual(diagnostic, b'')
+        finally:
+            if master is not None:
+                os.close(master)
+                master = None
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+    def test_connect_failures_classify_transport_without_echoing_stderr_or_clearing_password(self):
+        self.vault.save_ssh('entry.example', 22, 'private-password')
+        failures = ((b'Host key verification failed', '主机指纹校验失败'),
+                    (b'REMOTE HOST IDENTIFICATION HAS CHANGED\nHost key verification failed', '主机指纹发生变化'),
+                    (b'Connection refused', '拒绝连接'),
+                    (b'Connection timed out', '连接超时'),
+                    (b'Could not resolve hostname', '无法解析'),
+                    (b'No route to host', '网络路由'))
+        for message, expected in failures:
+            with self.subTest(message=message), \
+                    patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 255, stderr=message + b' private-password')), \
+                    self.assertRaises(DeployError) as error:
+                fixtures.deploy.SSH('entry.example', '/tmp/control', password_login=True).connect()
+            self.assertIn(expected, str(error.exception))
+            self.assertNotIn('private-password', str(error.exception))
+            self.assertEqual(self.vault.ssh('entry.example', 22), 'private-password')
 
     def test_public_or_linked_credentials_are_rejected(self):
         self.vault.save_ssh('entry.example', 22, 'private-password')

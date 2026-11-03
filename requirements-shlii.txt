@@ -1,0 +1,2 @@
+# Optional: required only for browser-assisted Shlii login.
+playwright>=1.45,<2

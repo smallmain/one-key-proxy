@@ -44,10 +44,9 @@ TEMPLATE = {
     "nodeNameIntraUniquify": False, "autoFillCountry": False, "backfillExistingCountry": False,
     "nodeCount": 1, "usageUpload": 123, "lastRunTime": None, "successCount": 1,
 }
-SS_TEMPLATE = {
-    "ID": 917, "Name": "[SM]Reference - local", "NameMode": "remark", "Protocol": "ss",
-    "Link": "ss://" + base64.urlsafe_b64encode(b"aes-128-gcm:private-ss-password").decode().rstrip("=")
-            + "@127.0.0.1:7896",
+LOCAL_TEMPLATE = {
+    "ID": 917, "Name": "[SM]Reference - local", "NameMode": "remark", "Protocol": "socks5",
+    "Link": "socks5://127.0.0.1:7896",
     "Group": "SM", "DialerProxyName": "", "Source": "manual", "SourceID": 0,
 }
 
@@ -143,7 +142,7 @@ class InteractiveTests(unittest.TestCase):
 
     def test_wizard_collects_public_deployment_and_local_choice(self):
         args = self.options()
-        with patch("builtins.input", side_effect=["root@host", "2222", "3", "public", "hk.example.com", "n"]):
+        with patch("builtins.input", side_effect=["1", "root@host", "2222", "3", "public", "hk.example.com", "n"]):
             deploy.configure_interactive(args, CONFIG)
         self.assertEqual(args.target, "root@host")
         self.assertEqual(args.port, 2222)
@@ -432,7 +431,7 @@ class ResumeTests(unittest.TestCase):
     def test_each_input_is_saved_before_the_next_prompt(self):
         args = self.args()
         self.seed()
-        with self.state.locked(), patch("builtins.input", side_effect=["root@host", "2222", KeyboardInterrupt]):
+        with self.state.locked(), patch("builtins.input", side_effect=["1", "root@host", "2222", KeyboardInterrupt]):
             with self.assertRaises(KeyboardInterrupt):
                 deploy.configure_interactive(args, CONFIG, self.state)
         saved = deploy.ResumeState().load()["options"]
@@ -668,8 +667,10 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                     if keyword in airport.get("remark", "") or keyword in airport.get("name", "")]
         elif self.command == "GET" and path == "/api/v1/nodes/get":
             search = urllib.parse.parse_qs(parsed.query).get("search", [""])[0]
-            data = [node for node in state["nodes"] + [state["ss_template"]]
-                    if search in node["Name"] or search in urllib.parse.unquote(node["Link"])]
+            protocol = urllib.parse.parse_qs(parsed.query).get("protocol", [""])[0]
+            data = [node for node in state["nodes"] + [state["local_template"]]
+                    if (not protocol or node["Protocol"] == protocol)
+                    and (search in node["Name"] or search in urllib.parse.unquote(node["Link"]))]
         elif self.command == "GET" and path == "/api/v1/nodes/parse-link":
             from deploy_links import parse_node_link
             try:
@@ -700,7 +701,7 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             if not state.get("skip_local"):
                 existing = next((n for n in state["nodes"] if n["Link"] == fields.get("oldlink")), None)
                 node_id = existing["ID"] if existing else max([917] + [n["ID"] for n in state["nodes"]]) + 1
-                node = dict(SS_TEMPLATE, ID=node_id, Name=fields["name"], Link=fields["link"],
+                node = dict(LOCAL_TEMPLATE, ID=node_id, Name=fields["name"], Link=fields["link"],
                             NameMode=fields["nameMode"], Group=fields["group"], DialerProxyName=fields["dialerProxyName"])
                 uri = urllib.parse.urlsplit(fields["link"])
                 node.update(Protocol=uri.scheme, LinkHost=uri.hostname, LinkPort=uri.port)
@@ -754,7 +755,7 @@ class SublinkTests(unittest.TestCase):
         self.addCleanup(root.stop)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), APIHandler)
         self.server.state = {"calls": [], "airports": [], "template": copy.deepcopy(TEMPLATE),
-                             "nodes": [], "ss_template": copy.deepcopy(SS_TEMPLATE), "tags": {917: ["stable"]}}
+                             "nodes": [], "local_template": copy.deepcopy(LOCAL_TEMPLATE), "tags": {917: ["stable"]}}
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.cleanup)
@@ -795,10 +796,11 @@ class SublinkTests(unittest.TestCase):
         link = urllib.parse.urlsplit(local["Link"])
         self.assertEqual(link.hostname, "127.0.0.1")
         self.assertEqual(link.port, 7897)
-        self.assertNotEqual(link.username, urllib.parse.urlsplit(SS_TEMPLATE["Link"]).username)
-        self.assertGreaterEqual(len(deploy.SingBox.ss_parameters(local["Link"])[2]), 32)
+        self.assertEqual((local["Protocol"], link.scheme), ("socks5", "socks5"))
+        self.assertIsNone(link.username)
+        self.assertIsNone(link.password)
         self.assertEqual(self.server.state["tags"][918], ["稳定"])
-        self.assertEqual(self.server.state["ss_template"], SS_TEMPLATE)
+        self.assertEqual(self.server.state["local_template"], LOCAL_TEMPLATE)
 
     def test_update_preserves_custom_airport_settings_and_names(self):
         self.client.sync(NODE, airport_name="My airport", node_name="My node", local_port=7897)
@@ -884,7 +886,7 @@ class SublinkTests(unittest.TestCase):
 
     def test_creation_uses_builtins_even_when_previous_reference_is_invalid(self):
         self.server.state["template"]["cronExpr"] = None
-        self.server.state["ss_template"]["Protocol"] = "socks"
+        self.server.state["local_template"]["Protocol"] = "socks"
         self.client.sync(NODE, local_port=7900)
         self.assertEqual(self.server.state["airports"][0]["cronExpr"], "0 0 * * *")
         calls = self.server.state["calls"]
@@ -925,7 +927,7 @@ class SublinkTests(unittest.TestCase):
             self.assertEqual(self.client.choose_local_port(interactive=True), 7901)
 
     def test_allocator_skips_sublink_configured_and_listening_ports(self):
-        self.server.state["nodes"] = [dict(SS_TEMPLATE, ID=999)]
+        self.server.state["nodes"] = [dict(LOCAL_TEMPLATE, ID=999)]
         path = deploy.ROOT / "singbox.json"
         path.write_text(json.dumps({"inbounds": [{"type": "mixed", "tag": "occupied", "listen_port": 7897}],
                                    "outbounds": [{"type": "direct", "tag": "direct"}], "route": {}}))
@@ -953,9 +955,9 @@ class SublinkTests(unittest.TestCase):
         self.assertNotIn("unsafe diagnostics", str(error.exception))
 
     def test_allocator_includes_last_port_and_fails_when_exhausted(self):
-        with patch.object(deploy, "LOCAL_SS_PORT_START", 65535), patch.object(self.client, "port_available", return_value=True):
+        with patch.object(deploy, "LOCAL_NODE_PORT_START", 65535), patch.object(self.client, "port_available", return_value=True):
             self.assertEqual(self.client.choose_local_port(), 65535)
-        with patch.object(deploy, "LOCAL_SS_PORT_START", 65535), patch.object(self.client, "port_available", return_value=False), \
+        with patch.object(deploy, "LOCAL_NODE_PORT_START", 65535), patch.object(self.client, "port_available", return_value=False), \
                 self.assertRaisesRegex(deploy.DeployError, "没有可自动分配"):
             self.client.choose_local_port()
 
@@ -963,7 +965,7 @@ class SublinkTests(unittest.TestCase):
         self.server.state["fail_after_local_write"] = True
         with self.assertRaises(deploy.DeployError):
             self.client.sync(NODE, local_port=7897)
-        self.assertIn("local Shadowsocks node verified", self.client.sync(NODE))
+        self.assertIn("local SOCKS5 node verified", self.client.sync(NODE))
         self.assertEqual(sum(path == "/api/v1/nodes/add" for _, path, _, _ in self.server.state["calls"]), 1)
 
     def test_local_update_preserves_tags_group_and_dialer(self):
@@ -978,7 +980,7 @@ class SublinkTests(unittest.TestCase):
     def test_existing_local_connection_and_name_cannot_be_adopted(self):
         with self.assertRaises(deploy.DeployError):
             self.client.sync(NODE, local_port=7896)
-        self.server.state["nodes"] = [dict(SS_TEMPLATE, ID=919, Name="[SM]HK node - \u672c\u5730")]
+        self.server.state["nodes"] = [dict(LOCAL_TEMPLATE, ID=919, Name="[SM]HK node - \u672c\u5730")]
         with self.assertRaises(deploy.DeployError):
             self.client.sync(NODE, local_port=7900)
         self.assertTrue(all(method == "GET" for method, _, _, _ in self.server.state["calls"]))
@@ -988,18 +990,23 @@ class SublinkTests(unittest.TestCase):
         with self.assertRaises(deploy.DeployError):
             self.client.sync(NODE, local_port=7897)
 
-    def test_new_nodes_have_independent_passwords_and_updates_keep_them(self):
+    def test_new_local_nodes_use_no_authentication_and_updates_keep_ports(self):
         self.client.sync(NODE, local_port=7897)
         first = self.server.state["nodes"][0]["Link"]
         self.client.sync(dict(NODE, INSTALLATION_ID="b" * 32, NODE_NAME="Other"), local_port=7900)
         second = self.server.state["nodes"][1]["Link"]
-        self.assertNotEqual(deploy.SingBox.ss_parameters(first)[2], deploy.SingBox.ss_parameters(second)[2])
+        for link, port in ((first, 7897), (second, 7900)):
+            uri = urllib.parse.urlsplit(link)
+            self.assertEqual((uri.scheme, uri.netloc), ("socks5", f"127.0.0.1:{port}"))
         self.client.sync(NODE)
         self.assertEqual(self.server.state["nodes"][0]["Link"], first)
 
-    def test_owned_local_node_must_be_loopback_shadowsocks(self):
+    def test_owned_local_node_rejects_protocol_mismatch_and_nonlocal_links(self):
         with self.assertRaises(deploy.DeployError):
-            self.client.local_ss_link(dict(SS_TEMPLATE, Protocol="socks5"))
+            self.client.local_link(dict(LOCAL_TEMPLATE, Protocol="ss"))
+        for link in ("socks5://example.com:7897", "socks5://user:pass@127.0.0.1:7897"):
+            with self.subTest(link=link), self.assertRaises(deploy.DeployError):
+                self.client.local_link(dict(LOCAL_TEMPLATE, Protocol="socks5", Link=link))
 
     def airport_only_client(self):
         config = dict(CONFIG, ENABLE_LOCAL_NODE="false")
@@ -1124,7 +1131,7 @@ class SublinkTests(unittest.TestCase):
     def test_sublink_shared_chain_blocks_deletion(self):
         self.client.sync(NODE, local_port=7900)
         local = self.server.state["nodes"][0]
-        self.server.state["nodes"].append(dict(SS_TEMPLATE, ID=999, Name="another chain", DialerProxyName=local["Name"]))
+        self.server.state["nodes"].append(dict(LOCAL_TEMPLATE, ID=999, Name="another chain", DialerProxyName=local["Name"]))
         record = {"airport_id": 21, "local_node_id": local["ID"]}
         with self.assertRaises(deploy.DeployError):
             self.client.deletion_candidates(NODE["INSTALLATION_ID"], record)
@@ -1155,8 +1162,8 @@ class SublinkTests(unittest.TestCase):
         self.server.state["airports"] = [dict(TEMPLATE, id=21, name="Child airport", remark="[okp:" + child_id + "]")]
         self.server.state["template"]["remark"] = "[okp:" + parent_id + "]"
         self.server.state["nodes"] = [
-            dict(SS_TEMPLATE, ID=201, Protocol="vless", Name="Child", SourceID=21, Link=NODE["VLESS_URI"]),
-            dict(SS_TEMPLATE, ID=101, Protocol="vless", Name="Parent", SourceID=11, Link=NODE["VLESS_URI"]),
+            dict(LOCAL_TEMPLATE, ID=201, Protocol="vless", Name="Child", SourceID=21, Link=NODE["VLESS_URI"]),
+            dict(LOCAL_TEMPLATE, ID=101, Protocol="vless", Name="Parent", SourceID=11, Link=NODE["VLESS_URI"]),
         ]
         state = deploy.ResumeState()
         with state.locked():
@@ -1185,8 +1192,8 @@ class SublinkTests(unittest.TestCase):
 
     def test_adopted_manual_remote_and_local_nodes_are_deleted_together(self):
         identity = "c" * 32
-        local = dict(SS_TEMPLATE, ID=507, Name="Home local", Link=SS_TEMPLATE["Link"] + "#okp-local:" + identity)
-        remote = dict(SS_TEMPLATE, ID=501, Name="Home", Protocol="vless", SourceID=0,
+        local = dict(LOCAL_TEMPLATE, ID=507, Name="Home local", Link=LOCAL_TEMPLATE["Link"] + "#okp-local:" + identity)
+        remote = dict(LOCAL_TEMPLATE, ID=501, Name="Home", Protocol="vless", SourceID=0,
                       Link=NODE["VLESS_URI"] + "#okp-remote:" + identity, DialerProxyName="Parent")
         self.server.state["nodes"] = [local, remote]
         record = {"kind": "adopted", "airport_id": None, "local_node_id": 507, "remote_node_id": 501}

@@ -194,6 +194,94 @@ test_certificate_renewal_rewrites_result_before_diagnostics() {
   assert_eq $'backup\nbegin:nat:198.51.100.40\ncreate:198.51.100.40\nactivate:nat:198.51.100.40\nhealth\nsubscriptions:198.51.100.40\ncomplete:nat:198.51.100.40\nresult\ndiagnostics' "$(<"$TEST_AUDIT")"
 }
 
+setup_reality_reconfiguration() {
+  reset_transition_test
+  REALITY_TARGET=www.cloudflare.com:443
+  REALITY_SNI=www.cloudflare.com
+  DEFAULT_REALITY_TARGET=www.tencentcloud.com:443
+  TEST_INBOUND='{"id":42,"enable":true,"port":443,"protocol":"vless","tag":"owned","settings":{"clients":[{"id":"keep-uuid"},{"id":"keep-second-client"}]},"streamSettings":{"security":"reality","realitySettings":{"dest":"www.cloudflare.com:443","target":"www.cloudflare.com:443","serverNames":["www.cloudflare.com"],"privateKey":"keep-key","shortIds":["abcd"],"settings":{"serverName":"www.cloudflare.com"}}}}'
+  _okp_i_find_owned_inbound() {
+    XUI_MANAGED_INBOUND_ID=42
+    XUI_MANAGED_INBOUND_JSON=$TEST_INBOUND
+  }
+  maintenance_read() {
+    assert_eq www.tencentcloud.com:443 "$3"
+    printf -v "$1" '%s' "$3"
+  }
+  config_validate() { REALITY_SNI=${REALITY_TARGET%%:*}; }
+  assert_reality_target_tls_reachable() { printf 'preflight:%s\n' "$1" >>"$TEST_AUDIT"; }
+  maintenance_confirm() { printf 'confirm\n' >>"$TEST_AUDIT"; }
+  maintenance_backup_create() { LAST_BACKUP_PATH=/protected/backup; printf 'backup\n' >>"$TEST_AUDIT"; }
+  xui_api_post() {
+    assert_eq /panel/api/inbounds/update/42 "$1"
+    printf 'update\n' >>"$TEST_AUDIT"
+    TEST_INBOUND=$2
+  }
+  config_save_state() { printf 'save:%s:%s\n' "$REALITY_TARGET" "$REALITY_SNI" >>"$TEST_AUDIT"; }
+  _okp_i_wait_service() { printf 'health\n' >>"$TEST_AUDIT"; }
+  xui_verify_xray_runtime() { assert_eq owned "$1"; assert_eq 443 "$2"; }
+  xui_api_get() { jq -nc --argjson inbound "$TEST_INBOUND" '{inbounds: [$inbound]}'; }
+  _okp_i_verify_subscription_delivery() { printf 'subscriptions\n' >>"$TEST_AUDIT"; }
+  _okp_i_write_result() { printf 'result\n' >>"$TEST_AUDIT"; }
+  okp_hook_diagnostics() { printf 'diagnostics\n' >>"$TEST_AUDIT"; }
+}
+
+test_reality_reconfiguration_preserves_clients_and_keys() {
+  setup_reality_reconfiguration
+  local before=$TEST_INBOUND
+  _okp_i_reconfigure_reality
+  assert_eq "$(jq -c '.settings' <<<"$before")" "$(jq -c '.settings' <<<"$TEST_INBOUND")"
+  jq -e '.port == 443 and .tag == "owned" and
+    .streamSettings.realitySettings.privateKey == "keep-key" and
+    .streamSettings.realitySettings.shortIds == ["abcd"] and
+    .streamSettings.realitySettings.target == "www.tencentcloud.com:443" and
+    .streamSettings.realitySettings.serverNames == ["www.tencentcloud.com"] and
+    .streamSettings.realitySettings.settings.serverName == "www.tencentcloud.com" and
+    (.streamSettings.realitySettings | has("dest") | not)' <<<"$TEST_INBOUND" >/dev/null
+  assert_contains "$(<"$TEST_AUDIT")" $'preflight:www.tencentcloud.com:443\nconfirm\nbackup\nhealth\nupdate\nsave:www.tencentcloud.com:443:www.tencentcloud.com\nhealth\nsubscriptions\nresult\ndiagnostics'
+  assert_eq /protected/backup "${TEST_STATE[LAST_RECONFIG_BACKUP]}"
+}
+
+test_reality_preflight_and_backup_failures_do_not_mutate_inbound() {
+  setup_reality_reconfiguration
+  assert_reality_target_tls_reachable() { return 1; }
+  assert_failure _okp_i_reconfigure_reality
+  assert_failure grep -q '^update$' "$TEST_AUDIT"
+  setup_reality_reconfiguration
+  maintenance_backup_create() { return 1; }
+  assert_failure _okp_i_reconfigure_reality
+  assert_failure grep -q '^update$' "$TEST_AUDIT"
+}
+
+test_reality_readback_failure_does_not_commit_new_state() {
+  setup_reality_reconfiguration
+  xui_api_post() { :; }
+  assert_failure _okp_i_reconfigure_reality
+  assert_failure grep -q '^save:' "$TEST_AUDIT"
+  assert_contains "$(<"$TEST_AUDIT")" '保护备份：/protected/backup'
+}
+
+test_reality_runtime_failure_is_not_reported_as_success() {
+  setup_reality_reconfiguration
+  local old_inbound=$TEST_INBOUND
+  xui_api_get() { jq -nc --argjson inbound "$old_inbound" '{inbounds: [$inbound]}'; }
+  assert_failure _okp_i_reconfigure_reality
+  assert_failure grep -q '^result$' "$TEST_AUDIT"
+  assert_contains "$(<"$TEST_AUDIT")" '验收未完成'
+}
+
+test_reality_retry_rechecks_runtime_before_refreshing_results() {
+  setup_reality_reconfiguration
+  REALITY_TARGET=$DEFAULT_REALITY_TARGET
+  assert_failure _okp_i_reconfigure_reality
+  assert_failure grep -q '^result$' "$TEST_AUDIT"
+  TEST_INBOUND=$(jq '.streamSettings.realitySettings.target = "www.tencentcloud.com:443"
+    | .streamSettings.realitySettings.serverNames = ["www.tencentcloud.com"]' <<<"$TEST_INBOUND")
+  _okp_i_reconfigure_reality
+  assert_contains "$(<"$TEST_AUDIT")" $'subscriptions\nresult\ndiagnostics'
+  assert_failure grep -q '^update$' "$TEST_AUDIT"
+}
+
 test_domain_reconfiguration_retires_old_acme_only_after_commit_checks() {
   reset_transition_test
   MODE=public
@@ -1114,6 +1202,16 @@ run_test 'NAT certificate replacement activates and commits its journal' test_na
 run_test 'preparing TLS transition recovery is bound to certificate SAN' test_preparing_transition_recovery_is_san_bound
 run_test 'active TLS transition recovery commits a healthy saved identity' test_active_transition_recovery_commits_matching_saved_identity
 run_test 'certificate renewal refreshes result before diagnostics' test_certificate_renewal_rewrites_result_before_diagnostics
+run_test 'REALITY target migration preserves clients and keys and verifies subscriptions' \
+  test_reality_reconfiguration_preserves_clients_and_keys
+run_test 'REALITY target migration does not mutate before preflight and backup succeed' \
+  test_reality_preflight_and_backup_failures_do_not_mutate_inbound
+run_test 'REALITY target migration refuses a stale API readback' \
+  test_reality_readback_failure_does_not_commit_new_state
+run_test 'REALITY target migration rejects a runtime still using the old target' \
+  test_reality_runtime_failure_is_not_reported_as_success
+run_test 'REALITY target migration retry verifies runtime and refreshes results' \
+  test_reality_retry_rechecks_runtime_before_refreshing_results
 run_test 'domain reconfiguration retires old ACME only after result and diagnostics' \
   test_domain_reconfiguration_retires_old_acme_only_after_commit_checks
 run_test 'failed result or diagnostics keeps the old ACME renewal config' \

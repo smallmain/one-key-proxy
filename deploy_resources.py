@@ -1,6 +1,5 @@
 """Local sing-box transactions and persistent deployment ownership records."""
 
-import base64
 import copy
 from dataclasses import dataclass
 import fcntl
@@ -89,7 +88,7 @@ class ManagedDeployments:
             raise ValueError
         allowed = {"target", "env_file", "sublink_url", "airport_id", "local_node_id", "airport_name",
                    "node_name", "local_port", "singbox", "status", "kind", "remote_node_id", "relay_id",
-                   "remote_fingerprints", "local_source", "ssh", "server", "residential", "part_errors", "remote_relay"}
+                   "remote_fingerprints", "ssh", "server", "residential", "part_errors", "remote_relay"}
         for identity, record in self.records.items():
             if not re.fullmatch(r"[0-9a-f]{32}", identity) or not isinstance(record, dict) or set(record) != allowed:
                 raise ValueError
@@ -100,7 +99,7 @@ class ManagedDeployments:
                 raise ValueError
             if record["status"] not in ("syncing", "active", "deleting", "adopting", "relaying", "updating") or record["kind"] not in ("deployment", "adopted", "subscription", "node", "remote-relay"):
                 raise ValueError
-            if (record["local_source"] not in ("remote", "custom") or not isinstance(record["remote_fingerprints"], list)
+            if (not isinstance(record["remote_fingerprints"], list)
                     or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v) for v in record["remote_fingerprints"])):
                 raise ValueError
             if record["relay_id"] is not None and not re.fullmatch(r"[0-9a-f]{32}", record["relay_id"]):
@@ -130,7 +129,7 @@ class ManagedDeployments:
             if relay is not None:
                 if (not isinstance(relay, dict) or set(relay) != {"entry_id", "exit_id", "exit_fingerprint", "pending_exit_id", "auto_name"}
                         or type(relay["auto_name"]) is not bool
-                        or record["relay_id"] is not None or record["local_source"] != "remote"
+                        or record["relay_id"] is not None
                         or any(not isinstance(relay[key], str) or not re.fullmatch(r"[0-9a-f]{32}", relay[key])
                                for key in ("entry_id", "exit_id"))
                         or (relay["exit_fingerprint"] is not None and not re.fullmatch(r"[0-9a-f]{64}", relay["exit_fingerprint"]))):
@@ -179,7 +178,7 @@ class ManagedDeployments:
                                       "airport_name": "" if kind in ("node", "remote-relay") else name,
                                       "node_name": name, "local_port": None, "singbox": None, "status": "syncing",
                                       "kind": kind, "remote_node_id": None, "relay_id": None,
-                                      "local_source": "remote", "remote_fingerprints": [], "ssh": None, "server": None,
+                                      "remote_fingerprints": [], "ssh": None, "server": None,
                                       "residential": False, "part_errors": {},
                                       "remote_relay": copy.deepcopy(remote_relay)}
         self.update(identity, target=target, env_file=str(env_file), status="syncing")
@@ -197,6 +196,8 @@ class ManagedDeployments:
         self.save()
         from deploy_credentials import Credentials
         Credentials(self.state).forget_panel(identity)
+        from deploy_shlii import Store
+        Store(self.state).product_path(identity).unlink(missing_ok=True)
 
     def select(self, value):
         matches = [identity for identity, record in self.records.items()
@@ -353,20 +354,15 @@ class SingBox:
         return result
 
     @staticmethod
-    def ss_parameters(link):
+    def local_inbound(link):
         try:
             uri = urllib.parse.urlsplit(link)
-            if uri.scheme != "ss" or uri.hostname != "127.0.0.1" or not uri.port or uri.query:
+            if (uri.scheme != "socks5" or uri.hostname != "127.0.0.1" or not uri.port
+                    or uri.netloc != f"127.0.0.1:{uri.port}" or uri.path or uri.query):
                 raise ValueError
-            auth = urllib.parse.unquote(uri.netloc.rsplit("@", 1)[0])
-            if ":" not in auth:
-                auth = base64.b64decode(auth + "=" * (-len(auth) % 4), altchars=b"-_", validate=True).decode()
-            method, password = auth.split(":", 1)
-            if not method or not password:
-                raise ValueError
-            return uri.port, method, password
-        except (ValueError, UnicodeError):
-            raise DeployError("本地 SS 节点参数无法转换为 sing-box 入站。") from None
+            return dict(SINGBOX_INBOUND, listen_port=uri.port)
+        except (TypeError, ValueError):
+            raise DeployError("本地 SOCKS5 节点必须使用 127.0.0.1、有效端口且无认证或扩展参数。") from None
 
     @staticmethod
     def references(value, tags, key=""):
@@ -400,7 +396,7 @@ class SingBox:
             raise DeployError("其他 sing-box 配置仍引用此部署，需先解除共享/链式引用。")
         return remainder
 
-    def plan(self, identity, vless_link=None, ss_link=None, metadata=None, remove=False, relay_tag=None,
+    def plan(self, identity, vless_link=None, local_link=None, metadata=None, remove=False, relay_tag=None,
              outbound_config=None):
         original, document = self.read()
         candidate = self.owned(document, identity, metadata, allow_references=not remove)
@@ -418,11 +414,12 @@ class SingBox:
                 raise DeployError("缺少 sing-box 所有权记录。")
             expected = {}
         else:
-            inbound, outbound = self.templates(document)
-            port, method, password = self.ss_parameters(ss_link)
+            _, outbound = self.templates(document)
+            inbound = self.local_inbound(local_link)
+            port = inbound["listen_port"]
             if any(i.get("listen_port") == port for i in candidate["inbounds"]):
                 raise DeployError("本地端口已被其他 sing-box 入站使用。")
-            inbound.update(tag=inbound_tag, listen_port=port, method=method, password=password)
+            inbound["tag"] = inbound_tag
             outbound = copy.deepcopy(outbound_config) if outbound_config is not None else self.vless(outbound, vless_link)
             if outbound.get("type") not in ("vless", "socks", "shadowsocks"):
                 raise DeployError("本地出站协议不受支持。")

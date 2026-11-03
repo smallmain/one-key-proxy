@@ -9,10 +9,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
-- Standalone VLESS, Shadowsocks and SOCKS5 node management from links or private files, with explicit adoption, duplicate detection, separate local outbounds and configuration-specific editing.
+- One-stop "Update configurations" menu and `update-configs` command, with local runtime synchronization, panel/core updates, legacy REALITY target migration, subscription/local-node refresh and resumable private journals; `update-panels` remains an alias.
+- Shlii account/product integration with optional browser-assisted login, resumable NAT mapping setup and explicit product refresh.
+- Configuration connectivity checks using isolated local proxy instances and the selected node's actual connection settings.
+- Standalone VLESS, Shadowsocks and SOCKS5 node management from links or private files, with explicit adoption, duplicate detection and configuration-specific editing.
 - Recoverable remote/local node changes with private journals and backups, stable IDs, relay rename propagation, and independent local-node removal.
 - Local Python/OpenSSH deployment with a Git-ignored `.env`, allowlisted installation defaults, built-in SublinkPro airport defaults and independent airport/node names.
-- Companion Surge local Shadowsocks nodes with independent random passwords, matching sing-box listeners, user-supplied ports and repeatable updates that retain credentials and tags.
+- Companion Surge local SOCKS5 nodes without authentication or encryption, matching loopback-only sing-box listeners, user-supplied ports and repeatable updates that retain IDs and tags.
 - Configuration management menu for install, add via SSH or subscription URL, delete, view and environment checks; relay settings live inside each configuration's details.
 - Unified `ENABLE_LOCAL_NODE` control for sing-box and SublinkPro local nodes, without external template IDs or tags; `add` replaces the former `sync` command with a compatibility alias.
 - Explicit SSH password login through the wizard or `--password`, with native hidden terminal input and authentication before upload over a shared connection.
@@ -24,6 +27,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- A pinned SublinkPro `v1.2.22` Docker patch adds native SOCKS5 Surge export, including client capability registration, regression tests, static checks and documented rollback.
 - NAT port prompts show internal defaults and accept external-only input, including dotenv mappings; edits retain the current internal port and allow Enter to keep the current mapping.
 - IPv6-disabled AliDNS deployments remove only owned AAAA records and refuse to continue while any AAAA remains.
 - Stage markers now require an exact stage name and valid completion timestamp; resource-free abandoned initialization state is recovered conservatively.
@@ -34,6 +38,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Change the default REALITY target to `www.tencentcloud.com:443`; add explicit, backed-up target migration with inbound readback and subscription verification for existing installations.
+- Document the 2026-11-02 upstream audit: 3x-ui v3.11.0 installer compatibility and the reproduced sing-box v1.14.4 / Xray v26.10.31 REALITY incompatibility; retain the core compatibility ceiling pending a verified fix.
 - 3x-ui release assets require and verify the official SHA-256 digest; upstream installer curl requests for `main` files are pinned to the same release commit.
 - Initial installation and maintenance updates check the adapted PATH-curl asset/helper download shape for compatibility drift; the pinned official installer commit remains an explicit root trust boundary.
 

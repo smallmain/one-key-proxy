@@ -1790,6 +1790,72 @@ _okp_i_finalize_reconfiguration() {
     fi
 }
 
+_okp_i_verify_reality_runtime() {
+    local tag port runtime
+    tag=$(jq -er '.tag' <<<"$XUI_MANAGED_INBOUND_JSON") || return 1
+    port=$(jq -er '.port' <<<"$XUI_MANAGED_INBOUND_JSON") || return 1
+    xui_verify_xray_runtime "$tag" "$port" 15 2 || return 1
+    runtime=$(xui_api_get /panel/api/server/getConfigJson) || return 1
+    jq -e --arg tag "$tag" --arg target "$REALITY_TARGET" --arg sni "$REALITY_SNI" '
+        if type == "string" then fromjson else . end
+        | [.inbounds[] | select(.tag == $tag)]
+        | length == 1 and (.[0].streamSettings |
+            .security == "reality" and
+            (.realitySettings.target // .realitySettings.dest) == $target and
+            .realitySettings.serverNames == [$sni])
+    ' >/dev/null <<<"$runtime"
+}
+
+_okp_i_reconfigure_reality() {
+    local old_target=$REALITY_TARGET payload
+    _okp_i_find_owned_inbound || return 1
+    maintenance_read REALITY_TARGET '新的 REALITY 目标（域名:端口）' "$DEFAULT_REALITY_TARGET" || return 1
+    config_validate || return 1
+    if [[ $REALITY_TARGET == "$old_target" ]]; then
+        log_info '没有配置变化。'
+        _okp_i_verify_reality_runtime || return 1
+        _okp_i_verify_subscription_delivery || return 1
+        _okp_i_write_result || return 1
+        okp_hook_diagnostics
+        return $?
+    fi
+    _okp_i_show_change 'REALITY 目标' "$old_target" "$REALITY_TARGET"
+    log_warn '所有客户端都需要刷新订阅或更新 SNI；更换目标不会关闭 REALITY 的未认证回落。'
+    assert_reality_target_tls_reachable "$REALITY_TARGET" || return 1
+    maintenance_confirm '确认更换 REALITY 目标？' n || return 1
+    maintenance_backup_create || return 1
+    state_set LAST_RECONFIG_BACKUP "$LAST_BACKUP_PATH" || return 1
+    # Re-read after confirmation; retain all current clients, keys and inbound settings.
+    _okp_i_wait_service || return 1
+    _okp_i_find_owned_inbound || return 1
+    payload=$(jq -ec --arg target "$REALITY_TARGET" --arg sni "$REALITY_SNI" '
+        select(.protocol == "vless" and .streamSettings.security == "reality")
+        | {enable, remark, listen, port, protocol, expiryTime, total, settings,
+         streamSettings, sniffing, tag, shareAddr, shareAddrStrategy,
+         trafficReset, trafficResetDay, subSortIndex}
+        | with_entries(select(.value != null))
+        | .streamSettings.realitySettings |=
+            (.target = $target | del(.dest) | .serverNames = [$sni]
+             | if (.settings.serverName // "") != "" then .settings.serverName = $sni else . end)
+    ' <<<"$XUI_MANAGED_INBOUND_JSON") || return 1
+    if ! xui_api_post "/panel/api/inbounds/update/${XUI_MANAGED_INBOUND_ID}" "$payload" >/dev/null ||
+        ! _okp_i_find_owned_inbound ||
+        ! jq -e --arg target "$REALITY_TARGET" --arg sni "$REALITY_SNI" '
+            .streamSettings.realitySettings.target == $target and
+            .streamSettings.realitySettings.serverNames == [$sni]
+        ' >/dev/null <<<"$XUI_MANAGED_INBOUND_JSON"; then
+        log_error "REALITY 目标更新未通过回读检查。保护备份：${LAST_BACKUP_PATH}"
+        return 1
+    fi
+    config_save_state || return 1
+    if ! _okp_i_wait_service || ! _okp_i_verify_reality_runtime || ! _okp_i_verify_subscription_delivery ||
+        ! _okp_i_write_result || ! okp_hook_diagnostics; then
+        log_error "REALITY 目标已写入，但验收未完成；请运行 one-key-proxy doctor。保护备份：${LAST_BACKUP_PATH}"
+        return 1
+    fi
+    log_info 'REALITY 目标重配完成；请刷新所有客户端订阅，并重新同步本机节点。'
+}
+
 okp_hook_reconfigure() {
     local scope=${1:-all} detected choice changed=0
     local old_public_ipv4 old_public_ipv6 old_enable_ipv6 old_fqdn zone
@@ -1798,6 +1864,10 @@ okp_hook_reconfigure() {
 
     _okp_i_load_config || return 1
     _okp_i_require_no_remote_relays || return 1
+    if [[ $scope == reality ]]; then
+        _okp_i_reconfigure_reality
+        return $?
+    fi
     _okp_i_resume_pending_acme_cleanup true || return 1
     old_public_ipv4=$PUBLIC_IPV4
     old_public_ipv6=$PUBLIC_IPV6

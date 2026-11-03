@@ -15,7 +15,7 @@ class Credentials:
             state = ResumeState()
         self.state = state
 
-    def read(self, path):
+    def read(self, path, *, max_bytes=16384):
         if not self.state.directory.exists():
             return None
         self.state.check_directory()
@@ -25,8 +25,8 @@ class Credentials:
             return None
         try:
             with os.fdopen(fd, 'r', encoding='utf-8') as stream:
-                raw = stream.read(16385)
-            if len(raw) > 16384:
+                raw = stream.read(max_bytes + 1)
+            if len(raw) > max_bytes:
                 raise ValueError
             value = json.loads(raw)
             if not isinstance(value, dict) or type(value.get('version')) is not int or value['version'] != 1:

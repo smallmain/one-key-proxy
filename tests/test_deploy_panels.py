@@ -213,6 +213,22 @@ class PanelMenuTests(unittest.TestCase):
         self.assertEqual(remote.call_args.args[1]['target'], 'v3.9.0')
         self.assertEqual(remote.call_args.args[1]['core_target'], 'v26.7.28')
 
+    def test_preflight_allows_compatible_versions_without_automatic_update_support(self):
+        information = {'current': 'v3.10.2', 'core_current': 'v26.7.28', 'updatable': False,
+                       'reason': '面板维护缺少可执行程序：systemctl。', 'pending': False}
+        with patch.object(panels, 'offer_update') as update:
+            panels.preflight(Mock(), information)
+        update.assert_not_called()
+
+    def test_preflight_still_refuses_incompatible_core_without_update_support(self):
+        information = {'current': 'v3.10.2', 'core_current': 'v26.9.30', 'updatable': False,
+                       'reason': '面板维护缺少可执行程序：systemctl。', 'pending': False}
+        with patch.dict(sys.modules, {'deploy': fixtures.deploy}), patch.object(sys.stdin, 'isatty', return_value=True), \
+                patch.object(panels, 'catalog', return_value=[release('v3.11.0')]), \
+                patch.object(panels, 'run_helper', return_value=information), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(DeployError, 'systemctl'):
+            panels.preflight(Mock(), information)
+
     def test_helper_sources_work_under_isolated_python_without_files_installed(self):
         def run(script, *, data, timeout):
             command = shlex.split(script)
@@ -576,6 +592,37 @@ class PanelUpdateServerTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_missing_maintenance_command_is_distinguished_from_timeout(self):
+        with patch.object(maintenance.subprocess, 'Popen', side_effect=FileNotFoundError), \
+                self.assertRaisesRegex(maintenance.PanelError, '缺少可执行程序：systemctl') as error:
+            COMMAND(['systemctl', 'show', 'x-ui.service'])
+        self.assertNotIn('超时', str(error.exception))
+
+    def test_core_version_survives_missing_service_manager(self):
+        (self.install / 'x-ui').write_text('v3.10.2')
+        (self.install / 'bin/xray-linux-amd64').write_text('Xray 26.7.28')
+
+        def run(arguments, **kwargs):
+            if arguments[0] == 'systemctl':
+                raise maintenance.PanelError('面板维护缺少可执行程序：systemctl。')
+            return self.command(arguments, **kwargs)
+
+        with patch.object(maintenance, 'command', side_effect=run):
+            information = maintenance.info()
+        self.assertEqual(information['current'], 'v3.10.2')
+        self.assertEqual(information['core_current'], 'v26.7.28')
+        self.assertFalse(information['updatable'])
+        self.assertIn('systemctl', information['reason'])
+        self.assertFalse((self.state / 'pending.json').exists())
+        self.assertEqual((self.database / 'x-ui.db').read_bytes(), self.original_database)
+
+    def test_unreadable_core_is_not_treated_as_compatible(self):
+        with patch.object(maintenance, 'core_version', side_effect=maintenance.PanelError('无法验证 Xray 版本')):
+            information = maintenance.info()
+        self.assertIsNone(information['core_current'])
+        self.assertFalse(information['updatable'])
+        self.assertIn('无法验证 Xray 版本', information['reason'])
+
     def test_external_database_is_refused_without_changes(self):
         with self.assertRaises(maintenance.PanelError):
             maintenance.database_environment([('XUI_DB_TYPE', 'postgres')])
@@ -653,7 +700,7 @@ class PanelWorkflowTests(unittest.TestCase):
                 patch.object(panels, 'run_helper', side_effect=remote) as call, \
                 contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
             fixtures.deploy.main([])
-        self.assertEqual([args[0][1]['operation'] for args in call.call_args_list], ['panel-info', 'panel-info', 'panel-update'])
+        self.assertEqual([args[0][1]['operation'] for args in call.call_args_list], ['panel-info', 'panel-info', 'panel-info', 'panel-update'])
         ssh.return_value.connect.assert_called_once()
         ssh.return_value.close.assert_called_once()
         self.assertIn('[x] 美国 / 美国备用', output.getvalue())

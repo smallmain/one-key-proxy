@@ -23,13 +23,13 @@ def main():
                 return 1
         else:
             # Preserve interactive host-key confirmation and one-time challenges.
-            with open('/dev/tty', 'r+', encoding='utf-8') as terminal:
+            with open('/dev/tty', 'r', encoding='utf-8') as reader, open('/dev/tty', 'w', encoding='utf-8') as writer:
                 if 'yes/no' in prompt.lower():
-                    terminal.write(prompt)
-                    terminal.flush()
-                    password = terminal.readline().rstrip('\n')
+                    writer.write(prompt)
+                    writer.flush()
+                    password = reader.readline().rstrip('\n')
                 else:
-                    password = getpass.getpass(prompt, stream=terminal)
+                    password = getpass.getpass(prompt, stream=writer)
         sys.stdout.write(password + '\n')
         return 0
     except (DeployError, OSError, ValueError, KeyError, EOFError):
